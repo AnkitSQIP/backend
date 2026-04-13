@@ -1,5 +1,6 @@
 import os
 import asyncio
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from logging.config import fileConfig
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
@@ -13,7 +14,30 @@ if config.config_file_name is not None:
 
 # Override sqlalchemy.url from environment
 database_url = os.environ.get("DATABASE_URL", "")
+db_connect_args = {}
 if database_url:
+    parsed = urlsplit(database_url)
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+
+    # asyncpg does not support sslmode in URL query params.
+    sslmode_value = None
+    filtered_pairs = []
+    for key, value in query_pairs:
+        key_lower = key.lower()
+        if key_lower == "sslmode":
+            sslmode_value = value.lower()
+            continue
+        if key_lower == "channel_binding":
+            continue
+        filtered_pairs.append((key, value))
+
+    if sslmode_value in {"require", "verify-ca", "verify-full"}:
+        db_connect_args["ssl"] = "require"
+
+    sanitized_url = urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(filtered_pairs), parsed.fragment)
+    )
+    database_url = sanitized_url
     config.set_main_option("sqlalchemy.url", database_url)
 
 # Import all models so Alembic can detect them
@@ -46,6 +70,7 @@ async def run_async_migrations() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=db_connect_args,
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

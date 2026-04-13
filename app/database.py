@@ -3,14 +3,19 @@ from sqlalchemy.orm import DeclarativeBase
 from app.config import settings
 
 
-# Neon serverless Postgres — modest pool for Koyeb free tier (0.1 vCPU, 512 MB).
-# sslmode=require is embedded in the DATABASE_URL from Neon; asyncpg honours it.
+# asyncpg does not accept sslmode= in the URL — SSL must be passed via connect_args.
+# Strip any ?sslmode=... or &channel_binding=... from the URL before passing to engine.
+import re as _re
+_db_url = _re.sub(r'[?&](sslmode|channel_binding)=[^&]*', '', settings.database_url)
+_db_url = _db_url.rstrip('?&')
+
 engine = create_async_engine(
-    settings.database_url,
+    _db_url,
     echo=False,
     pool_pre_ping=True,
     pool_size=5,
     max_overflow=10,
+    connect_args={"ssl": "require"},
 )
 
 AsyncSessionLocal = async_sessionmaker(

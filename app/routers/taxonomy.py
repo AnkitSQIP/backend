@@ -78,10 +78,13 @@ def _safe_parse_id_array(content: str, finish_reason: str, patent_number: str = 
 
 
 # ── SCALE CONTROLS ───────────────────────────────────────────────────────────
-# Limit concurrent LLM calls when many patents are processed simultaneously
-# (frontend sends batches of 5; semaphore ensures we never exceed 12 in-flight)
-MAX_CONCURRENT_LLM = 12
+# Semaphore limits concurrent LLM calls (paid OpenRouter = no platform RPM cap)
+MAX_CONCURRENT_LLM = 20
 _CLASSIFY_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_LLM)
+COMMIT_BATCH_SIZE = 50  # commit to DB every N patents in bulk jobs
+
+# In-memory job registry (single-worker deployment — no cross-process sharing needed)
+_BULK_JOBS: dict[str, dict] = {}
 
 
 def _passes_domain_screen(
@@ -118,6 +121,272 @@ def _passes_domain_screen(
 
     # Only return False when we had keyword lists and none matched
     return not has_any_keywords
+
+
+# ── BULK CLASSIFY BACKGROUND TASK ────────────────────────────────────────────
+
+async def _flush_bulk_chunk(
+    db: AsyncSession,
+    buffer: list[tuple],
+    node_label_map: dict[str, str],
+    user_email: str,
+) -> None:
+    """Write a chunk of classified patents to DB and commit."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    for patent, tag_ids in buffer:
+        if tag_ids is None:
+            continue  # LLM failure — leave as pending
+        if tag_ids:
+            for nid in tag_ids:
+                exists = await db.scalar(
+                    select(PatentTaxonomy).where(
+                        PatentTaxonomy.patent_number == patent.patent_number,
+                        PatentTaxonomy.taxonomy_node_id == nid,
+                    )
+                )
+                if not exists:
+                    db.add(PatentTaxonomy(
+                        patent_number=patent.patent_number,
+                        taxonomy_node_id=nid,
+                        taxonomy_label=node_label_map.get(nid, ""),
+                        assigned_by=f"ai_bulk:{user_email}",
+                    ))
+            patent.review_status = "reviewed"
+            patent.reviewed_at = now
+        # no_match (empty list): leave as pending
+    await db.commit()
+
+
+async def _bulk_classify_task(
+    job_id: str,
+    workspace_id: uuid.UUID,
+    include_claims: bool,
+    user_email: str,
+) -> None:
+    """Server-side background task: classify ALL pending patents in workspace."""
+    from app.database import AsyncSessionLocal
+
+    _BULK_JOBS[job_id].update({
+        "status": "running", "done": 0, "total": 0,
+        "tagged": 0, "no_match": 0, "failed": 0,
+    })
+    try:
+        async with AsyncSessionLocal() as db:
+            # Load all pending patents
+            patent_result = await db.scalars(
+                select(Patent).where(
+                    Patent.workspace_id == workspace_id,
+                    Patent.review_status == "pending",
+                )
+            )
+            patents = list(patent_result.all())
+            total = len(patents)
+            _BULK_JOBS[job_id]["total"] = total
+            if total == 0:
+                _BULK_JOBS[job_id]["status"] = "done"
+                return
+
+            # Load taxonomy and build tree once (shared across all patents)
+            nodes_result = await db.scalars(
+                select(TaxonomyNode).where(TaxonomyNode.workspace_id == workspace_id)
+            )
+            all_nodes = list(nodes_result.all())
+            if not all_nodes:
+                _BULK_JOBS[job_id].update({"status": "error", "error": "No taxonomy nodes configured"})
+                return
+
+            node_map = {n.node_id: n for n in all_nodes}
+            roots = [n for n in all_nodes if not n.parent_id or n.parent_id not in node_map]
+            children = [n for n in all_nodes if n.parent_id and n.parent_id in node_map]
+            id_to_node = {n.node_id: n for n in all_nodes}
+            node_label_map = {n.node_id: n.label for n in all_nodes}
+
+            tree_lines: list[str] = []
+            for n in roots + children:
+                if n.parent_id and n.parent_id in node_map:
+                    desc_str = f" — {n.description}" if n.description else ""
+                    parent_label = node_map[n.parent_id].label
+                    tree_lines.append(f"  [TAG] {n.node_id}: {parent_label} > {n.label}{desc_str}")
+                else:
+                    tree_lines.append(f"[CATEGORY - DO NOT TAG] {n.node_id}: {n.label}")
+
+            taxonomy_tree = "\n".join(tree_lines)
+            if len(taxonomy_tree) > 22000:
+                taxonomy_tree = taxonomy_tree[:22000].rsplit("\n", 1)[0]
+
+            roots_list = "\n".join(f"  • {n.label}" for n in roots)
+            system_content = (
+                "You are an expert patent classifier performing multi-label taxonomy classification.\n"
+                "Output ONLY a valid JSON object: {\"evidence\":{...},\"tags\":[...]}.\n"
+                "Rules:\n"
+                "• Only use IDs from [TAG] entries — never [CATEGORY] IDs or invented IDs.\n"
+                "• Every tag must be backed by a direct claim quote in the evidence dict.\n"
+                "• Check ALL claims (independent + dependent) before deciding on each tag.\n"
+                "• Material tags: the named material must apply to the correct device component.\n"
+                "• Mechanism tags: require an explicitly named structural element, not implied behavior.\n"
+                "• Delivery tags: primary independent claim must BE the delivery component.\n"
+                "• When uncertain: NO is correct. Zero tags is acceptable; wrong tags are not.\n"
+                "• No text outside the JSON object."
+            )
+            llm = get_llm()
+            _RETRY_BACKOFF = [2, 5, 10]
+
+            async def classify_one(patent: Patent) -> tuple:
+                title = (patent.title or "").strip()
+                abstract = (patent.abstract or "")[:800].strip()
+                assignee = (patent.assignee or "").strip()
+                cpc = (patent.cpc_class or "").strip()
+                claims_raw = (patent.claims_text or patent.first_claim or "").strip() if include_claims else (patent.first_claim or "").strip()
+                claims_section = claims_raw[:10000]
+
+                # Tier 1: keyword pre-screen (no LLM cost)
+                if not _passes_domain_screen(title, abstract, patent.first_claim or "", roots):
+                    logger.info(f"Bulk pre-screen: {patent.patent_number} skipped")
+                    return patent, []
+
+                prompt = (
+                    f"PATENT TAXONOMY CLASSIFICATION\n\n"
+                    f"Quality standard: Correct tagging > Complete tagging. "
+                    f"Assign ZERO tags rather than one wrong tag. "
+                    f"Only tag what you can directly quote from a claim.\n\n"
+                    f"━━━ PATENT ━━━\n"
+                    f"Title: {title}\n"
+                    f"{f'Assignee: {assignee}' if assignee else ''}\n"
+                    f"{f'CPC: {cpc}' if cpc else ''}\n"
+                    f"Abstract: {abstract}\n\n"
+                    f"{f'Claims:{chr(10)}{claims_section}' if claims_section else ''}\n\n"
+                    f"━━━ STEP 1: DOMAIN SCREEN ━━━\n"
+                    f"Does this patent primarily claim a device, method, or system in these domains?\n"
+                    f"{roots_list}\n"
+                    f"→ If NONE apply → return {{\"evidence\":{{}},\"tags\":[]}} immediately.\n"
+                    f"→ If YES → continue to Step 2.\n\n"
+                    f"━━━ STEP 2: PER-TAG EVALUATION ━━━\n"
+                    f"For EVERY [TAG] listed in the taxonomy below:\n"
+                    f"  a. Read its Description to understand what evidence qualifies.\n"
+                    f"  b. If Description contains 'QUALIFYING PHRASES:', search the patent claims for those\n"
+                    f"     exact phrases first — a verbatim or near-verbatim match is strong evidence.\n"
+                    f"  c. IMPORTANT: Check EVERY claim — independent AND dependent.\n"
+                    f"     Dependent claims contain material types, mechanisms, and functional details\n"
+                    f"     that are where secondary tags often live.\n"
+                    f"  d. Decide YES (you can quote a claim sentence) or NO (not found or ambiguous).\n\n"
+                    f"TAXONOMY:\n"
+                    f"[CATEGORY - DO NOT TAG] = grouping only — NEVER return these IDs.\n"
+                    f"[TAG] = only these IDs may appear in your output.\n"
+                    f"{taxonomy_tree}\n\n"
+                    f"━━━ STEP 3: PRECISION FILTER ━━━\n"
+                    f"Remove a YES tag if ANY of these apply:\n"
+                    f"  ✗ Evidence is in background or prior art section — not in a claim\n"
+                    f"  ✗ Material tag: named material applies to wrong component\n"
+                    f"  ✗ Mechanism tag: behavior is implied, not an explicitly named mechanism element\n"
+                    f"  ✗ Delivery tag: primary independent claim is the implant, not the delivery system\n"
+                    f"  ✗ Still uncertain after checking all claims → default NO\n\n"
+                    f"━━━ OUTPUT FORMAT ━━━\n"
+                    f"Return ONLY this JSON — no text before or after:\n"
+                    f'{{\"evidence\":{{\"node_id\":\"exact claim quote\"}},\"tags\":[\"node_id_1\"]}}\n'
+                    f"'evidence': one key per YES tag, value = the claim sentence that justifies it.\n"
+                    f"'tags': final node_ids after Step 3 filter. Both may be empty."
+                )
+
+                last_exc = None
+                async with _CLASSIFY_SEMAPHORE:
+                    for attempt in range(3):
+                        try:
+                            response = await llm.chat.completions.create(
+                                model="deepseek/deepseek-v3.2",
+                                messages=[
+                                    {"role": "system", "content": system_content},
+                                    {"role": "user", "content": prompt},
+                                ],
+                                max_tokens=1500,
+                                temperature=0.0,
+                            )
+                            last_exc = None
+                            break
+                        except Exception as e:
+                            last_exc = e
+                            logger.warning(f"Bulk LLM attempt {attempt+1}/3 for {patent.patent_number}: {e}")
+                            if attempt < 2:
+                                await asyncio.sleep(_RETRY_BACKOFF[attempt])
+
+                if last_exc is not None:
+                    logger.error(f"Bulk classify: {patent.patent_number} failed after 3 attempts: {last_exc}")
+                    return patent, None
+
+                choice = response.choices[0]
+                finish_reason = getattr(choice, "finish_reason", "stop") or "stop"
+                content = (choice.message.content or "").strip()
+                raw_ids = _safe_parse_id_array(content, finish_reason, patent_number=patent.patent_number)
+                tag_ids = [nid for nid in raw_ids if nid in id_to_node and id_to_node[nid].level > 0]
+                return patent, tag_ids
+
+            # Launch all patent tasks — semaphore caps concurrency at MAX_CONCURRENT_LLM
+            tasks = [asyncio.ensure_future(classify_one(p)) for p in patents]
+            commit_buffer: list[tuple] = []
+
+            for coro in asyncio.as_completed(tasks):
+                patent, tag_ids = await coro
+                commit_buffer.append((patent, tag_ids))
+
+                if tag_ids is None:
+                    _BULK_JOBS[job_id]["failed"] += 1
+                elif tag_ids:
+                    _BULK_JOBS[job_id]["tagged"] += 1
+                else:
+                    _BULK_JOBS[job_id]["no_match"] += 1
+                _BULK_JOBS[job_id]["done"] += 1
+
+                if len(commit_buffer) >= COMMIT_BATCH_SIZE:
+                    await _flush_bulk_chunk(db, commit_buffer, node_label_map, user_email)
+                    commit_buffer.clear()
+                    logger.info(
+                        f"Job {job_id}: committed chunk — "
+                        f"{_BULK_JOBS[job_id]['done']}/{total} done, "
+                        f"{_BULK_JOBS[job_id]['tagged']} tagged"
+                    )
+
+            if commit_buffer:
+                await _flush_bulk_chunk(db, commit_buffer, node_label_map, user_email)
+
+        _BULK_JOBS[job_id]["status"] = "done"
+        logger.info(
+            f"Bulk classify job {job_id} complete: "
+            f"{_BULK_JOBS[job_id]['tagged']} tagged, "
+            f"{_BULK_JOBS[job_id]['no_match']} no-match, "
+            f"{_BULK_JOBS[job_id]['failed']} failed"
+        )
+    except Exception as exc:
+        logger.error(f"Bulk classify job {job_id} crashed: {exc}", exc_info=True)
+        _BULK_JOBS[job_id].update({"status": "error", "error": str(exc)})
+
+
+@router.post("/taxonomy/classify-workspace")
+async def start_bulk_classify(
+    workspace_id: str = Query(...),
+    include_claims: bool = Query(True),
+    current_user: dict = Depends(require_role(["ADMIN", "admin", "ANALYST", "analyst"])),
+    db: AsyncSession = Depends(get_db),
+):
+    """Start a server-side background classification job for all pending patents."""
+    ws_uuid = _parse_ws_uuid(workspace_id)
+    job_id = str(uuid.uuid4())
+    user_email = current_user.get("email", "system")
+    _BULK_JOBS[job_id] = {"status": "queued", "done": 0, "total": 0, "tagged": 0, "no_match": 0, "failed": 0}
+    asyncio.create_task(_bulk_classify_task(job_id, ws_uuid, include_claims, user_email))
+    logger.info(f"Bulk classify job {job_id} started for workspace {workspace_id} by {user_email}")
+    return {"job_id": job_id, "status": "queued"}
+
+
+@router.get("/taxonomy/classify-workspace/{job_id}")
+async def get_bulk_classify_status(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Poll the status of a bulk classification job."""
+    job = _BULK_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 # ── TAXONOMY NODES ────────────────────────────────────────────────────────────

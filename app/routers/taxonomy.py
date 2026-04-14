@@ -225,16 +225,15 @@ async def _bulk_classify_task(
             roots_list = "\n".join(f"  • {n.label}" for n in roots)
             system_content = (
                 "You are an expert patent classifier performing multi-label taxonomy classification.\n"
-                "Output ONLY a valid JSON object: {\"evidence\":{...},\"tags\":[...]}.\n"
+                "Output ONLY a JSON array of matched node IDs: [\"id1\",\"id2\"] or [] for no match.\n"
                 "Rules:\n"
                 "• Use IDs from both [ROOT TAG] and [TAG] entries — never invented IDs.\n"
-                "• [ROOT TAG]: apply only when patent's primary subject clearly falls under this broad category with direct claim evidence.\n"
-                "• [TAG]: apply only when you can quote exact claim language matching its description.\n"
-                "• Every tag (root or child) must have a direct claim quote in the evidence dict.\n"
-                "• Check ALL claims (independent + dependent) before deciding on each tag.\n"
+                "• [ROOT TAG]: apply only when patent's primary subject clearly falls under this broad category — needs direct claim evidence.\n"
+                "• [TAG]: apply only when exact claim language matches description or QUALIFYING PHRASES.\n"
+                "• Check ALL claims (independent + dependent) before deciding.\n"
                 "• Never tag from abstract, background, or prior art — claims only.\n"
-                "• When uncertain: NO is correct. Zero tags is acceptable; wrong tags are not.\n"
-                "• No text outside the JSON object."
+                "• When uncertain: NO. Zero tags acceptable; wrong tags are not.\n"
+                "• Output ONLY the JSON array — no text, no keys, no explanation."
             )
             llm = get_llm()
             _RETRY_BACKOFF = [2, 5, 10]
@@ -290,10 +289,9 @@ async def _bulk_classify_task(
                     f"  ✗ Delivery tag: primary independent claim is the implant, not the delivery system\n"
                     f"  ✗ Still uncertain after checking all claims → default NO\n\n"
                     f"━━━ OUTPUT FORMAT ━━━\n"
-                    f"Return ONLY this JSON — no text before or after:\n"
-                    f'{{\"evidence\":{{\"node_id\":\"exact claim quote\"}},\"tags\":[\"node_id_1\"]}}\n'
-                    f"'evidence': one key per YES tag, value = the claim sentence that justifies it.\n"
-                    f"'tags': final node_ids after Step 3 filter. Both may be empty."
+                    f"Return ONLY a JSON array — no text before or after:\n"
+                    f'[\"node_id_1\", \"node_id_2\"]\n'
+                    f"Empty array [] if no tags pass. No keys, no evidence, no explanation."
                 )
 
                 last_exc = None
@@ -306,7 +304,7 @@ async def _bulk_classify_task(
                                     {"role": "system", "content": system_content},
                                     {"role": "user", "content": prompt},
                                 ],
-                                max_tokens=1500,
+                                max_tokens=300,
                                 temperature=0.0,
                             )
                             last_exc = None

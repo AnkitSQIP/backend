@@ -265,10 +265,10 @@ async def _bulk_classify_task(
                     f"━━━ STEP 1: DOMAIN SCREEN ━━━\n"
                     f"Does this patent primarily claim a device, method, or system in these domains?\n"
                     f"{roots_list}\n"
-                    f"→ If NONE apply → return {{\"evidence\":{{}},\"tags\":[]}} immediately.\n"
+                    f"→ If NONE apply → return [] immediately.\n"
                     f"→ If YES → continue to Step 2.\n\n"
                     f"━━━ STEP 2: PER-TAG EVALUATION ━━━\n"
-                    f"For EVERY [TAG] listed in the taxonomy below:\n"
+                    f"Evaluate EVERY node in the taxonomy below — both [ROOT TAG] and [TAG]:\n"
                     f"  a. Read its Description to understand what evidence qualifies.\n"
                     f"  b. If Description contains 'QUALIFYING PHRASES:', search the patent claims for those\n"
                     f"     exact phrases first — a verbatim or near-verbatim match is strong evidence.\n"
@@ -306,6 +306,7 @@ async def _bulk_classify_task(
                                 ],
                                 max_tokens=300,
                                 temperature=0.0,
+                                timeout=45,  # 45s hard cap — compact output, no reason to wait longer
                             )
                             last_exc = None
                             break
@@ -325,6 +326,19 @@ async def _bulk_classify_task(
                 raw_ids = _safe_parse_id_array(content, finish_reason, patent_number=patent.patent_number)
                 tag_ids = [nid for nid in raw_ids if nid in id_to_node]
                 return patent, tag_ids
+
+            # Tier-1 pre-screen stats (logged before launch so we know filter rate)
+            screened_count = sum(
+                1 for p in patents
+                if not _passes_domain_screen(
+                    (p.title or ""), (p.abstract or "")[:800], (p.first_claim or ""), roots
+                )
+            )
+            logger.info(
+                f"Bulk classify job {job_id}: {total} patents — "
+                f"{total - screened_count} pass Tier-1 screen (get LLM call), "
+                f"{screened_count} filtered as out-of-domain"
+            )
 
             # Launch all patent tasks — semaphore caps concurrency at MAX_CONCURRENT_LLM
             tasks = [asyncio.ensure_future(classify_one(p)) for p in patents]

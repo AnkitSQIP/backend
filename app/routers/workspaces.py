@@ -2,7 +2,7 @@ import uuid
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Form
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, outerjoin
 from app.models import Workspace, WorkspaceUser, Patent, PatentTaxonomy, TaxonomyNode, User
 from app.deps import get_db, get_current_user, require_role
 
@@ -50,31 +50,39 @@ async def list_workspaces(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Single query: workspaces + patent counts via LEFT JOIN GROUP BY
+    count_subq = (
+        select(Patent.workspace_id, func.count(Patent.id).label("cnt"))
+        .group_by(Patent.workspace_id)
+        .subquery()
+    )
+
     if current_user.get("role") in ["ADMIN", "admin"]:
-        result = await db.scalars(select(Workspace))
-        workspaces = list(result.all())
+        rows = await db.execute(
+            select(Workspace, func.coalesce(count_subq.c.cnt, 0).label("patent_count"))
+            .outerjoin(count_subq, count_subq.c.workspace_id == Workspace.id)
+        )
     else:
         uid = uuid.UUID(current_user["user_id"])
-        result = await db.scalars(
-            select(Workspace)
+        rows = await db.execute(
+            select(Workspace, func.coalesce(count_subq.c.cnt, 0).label("patent_count"))
             .join(WorkspaceUser, WorkspaceUser.workspace_id == Workspace.id)
+            .outerjoin(count_subq, count_subq.c.workspace_id == Workspace.id)
             .where(WorkspaceUser.user_id == uid)
         )
-        workspaces = list(result.all())
 
-    out = []
-    for ws in workspaces:
-        count = await db.scalar(
-            select(func.count()).select_from(Patent).where(Patent.workspace_id == ws.id)
-        )
-        out.append({
-            "id": str(ws.id),
-            "name": ws.name,
-            "workspace_code": ws.workspace_code,
-            "description": ws.description,
-            "patent_count": count or 0,
-        })
-    return {"workspaces": out}
+    return {
+        "workspaces": [
+            {
+                "id": str(ws.id),
+                "name": ws.name,
+                "workspace_code": ws.workspace_code,
+                "description": ws.description,
+                "patent_count": int(cnt),
+            }
+            for ws, cnt in rows
+        ]
+    }
 
 
 @router.get("/workspaces/{workspace_id}/members")

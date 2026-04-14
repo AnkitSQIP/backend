@@ -6,7 +6,7 @@ All prompts used in the system. Exact text as implemented in `app/routers/taxono
 
 ## 1. Description Enhancement — Root Category Node
 
-**Endpoint**: `POST /api/taxonomy/enhance-all-descriptions` (for nodes with `level == 0`)  
+**Endpoint**: `POST /api/taxonomy/enhance-all-descriptions` (nodes with `level == 0`)  
 **Model**: `deepseek/deepseek-v3.2` · `max_tokens: 700` · `temperature: 0.2`
 
 **System prompt** (`_ENHANCE_SYSTEM`):
@@ -39,11 +39,14 @@ Output format: description paragraph, then [SCREEN KEYWORDS: ...] on its own lin
 No other text.
 ```
 
+**Output written to DB**: full text including `[SCREEN KEYWORDS: ...]` line.  
+Keywords are parsed at classification time by `_passes_domain_screen()` for Tier-1 pre-screening.
+
 ---
 
 ## 2. Description Enhancement — Child/Leaf Node
 
-**Endpoint**: `POST /api/taxonomy/enhance-all-descriptions` (for nodes with `level > 0`)  
+**Endpoint**: `POST /api/taxonomy/enhance-all-descriptions` (nodes with `level > 0`)  
 **Model**: `deepseek/deepseek-v3.2` · `max_tokens: 700` · `temperature: 0.2`
 
 **System prompt**: same as root (see above)
@@ -85,29 +88,36 @@ Include dependent claim patterns — secondary tags often live in dependent clai
 Output the paragraph first, then QUALIFYING PHRASES on its own line. No other formatting.
 ```
 
+**Output written to DB**: full text including `QUALIFYING PHRASES:` line.  
+The classifier reads this directly and uses phrases as verbatim search targets.
+
 ---
 
 ## 3. Bulk Workspace Classification (Automate Tags)
 
 **Endpoint**: `POST /api/taxonomy/classify-workspace`  
-**Model**: `deepseek/deepseek-v3.2` · `max_tokens: 1500` · `temperature: 0.0`  
+**Model**: `deepseek/deepseek-v3.2` · `max_tokens: 300` · `temperature: 0.0`  
 **Concurrency**: Semaphore(20) · Retry: 3 attempts with [2s, 5s, 10s] backoff  
+**DB writes**: Bulk `INSERT ... ON CONFLICT DO NOTHING` — no N×M individual queries  
 **Tier 1**: Keyword pre-screen via `[SCREEN KEYWORDS]` in root descriptions (no LLM cost)
+
+> **Output format**: bare JSON array `["id1","id2"]` — no evidence dict.
+> Evidence is omitted for speed (reduces output from ~600 tokens → ~30 tokens per patent).
+> Model reasoning is unchanged; only the output format is compact.
 
 **System prompt**:
 ```
 You are an expert patent classifier performing multi-label taxonomy classification.
-Output ONLY a valid JSON object: {"evidence":{...},"tags":[...]}.
+Output ONLY a JSON array of matched node IDs: ["id1","id2"] or [] for no match.
 Rules:
 • Use IDs from both [ROOT TAG] and [TAG] entries — never invented IDs.
 • [ROOT TAG]: apply only when patent's primary subject clearly falls under this broad
-  category with direct claim evidence.
-• [TAG]: apply only when you can quote exact claim language matching its description.
-• Every tag (root or child) must have a direct claim quote in the evidence dict.
-• Check ALL claims (independent + dependent) before deciding on each tag.
+  category — needs direct claim evidence.
+• [TAG]: apply only when exact claim language matches description or QUALIFYING PHRASES.
+• Check ALL claims (independent + dependent) before deciding.
 • Never tag from abstract, background, or prior art — claims only.
-• When uncertain: NO is correct. Zero tags is acceptable; wrong tags are not.
-• No text outside the JSON object.
+• When uncertain: NO. Zero tags acceptable; wrong tags are not.
+• Output ONLY the JSON array — no text, no keys, no explanation.
 ```
 
 **User prompt**:
@@ -131,7 +141,7 @@ Does this patent primarily claim a device, method, or system in these domains?
   • {root_category_1}
   • {root_category_2}
   ...
-→ If NONE apply → return {"evidence":{},"tags":[]} immediately.
+→ If NONE apply → return [] immediately.
 → If YES → continue to Step 2.
 
 ━━━ STEP 2: PER-TAG EVALUATION ━━━
@@ -160,10 +170,9 @@ Remove a YES tag if ANY of these apply:
   ✗ Still uncertain after checking all claims → default NO
 
 ━━━ OUTPUT FORMAT ━━━
-Return ONLY this JSON — no text before or after:
-{"evidence":{"node_id":"exact claim quote"},"tags":["node_id_1"]}
-'evidence': one key per YES tag, value = the claim sentence that justifies it.
-'tags': final node_ids after Step 3 filter. Both may be empty.
+Return ONLY a JSON array — no text before or after:
+["node_id_1", "node_id_2"]
+Empty array [] if no tags pass. No keys, no evidence, no explanation.
 ```
 
 ---
@@ -174,28 +183,70 @@ Return ONLY this JSON — no text before or after:
 **Model**: `deepseek/deepseek-v3.2` · `max_tokens: 1500` · `temperature: 0.0`  
 **Option**: `include_claims=true` sends full claims text (default: first claim only)
 
-**System prompt**: same as Bulk Classification (see above)
+> **Output format**: full evidence dict `{"evidence":{...},"tags":[...]}` — kept for
+> traceability and debugging on single-patent calls.
 
-**User prompt**: same structure as Bulk Classification, but for a single patent.  
-With `include_claims=false`: only `first_claim` is included in claims section.  
-With `include_claims=true`: full `claims_text` (up to 10,000 chars) is included.
+**System prompt**:
+```
+You are an expert patent classifier performing multi-label taxonomy classification.
+Output ONLY a valid JSON object: {"evidence":{...},"tags":[...]}.
+Rules:
+• Use IDs from both [ROOT TAG] and [TAG] entries — never invented IDs.
+• [ROOT TAG]: apply only when patent's primary subject clearly falls under this broad
+  category — needs direct claim evidence.
+• [TAG]: apply only when exact claim language matches description or QUALIFYING PHRASES.
+• Every tag must have a direct claim quote in the evidence dict.
+• Check ALL claims (independent + dependent) before deciding.
+• Never tag from abstract, background, or prior art — claims only.
+• When uncertain: NO. Zero tags acceptable; wrong tags are not.
+• No text outside the JSON object.
+```
+
+**User prompt**: same structure as Bulk Classification (Steps 1–3), with output format:
+```
+━━━ OUTPUT FORMAT ━━━
+Return ONLY this JSON — no text before or after:
+{"evidence":{"node_id":"exact claim quote"},"tags":["node_id_1"]}
+'evidence': one key per YES tag, value = the claim sentence that justifies it.
+'tags': final node_ids after Step 3 filter. Both may be empty.
+```
+
+With `include_claims=false`: only `first_claim` sent in claims section.  
+With `include_claims=true`: full `claims_text` (up to 10,000 chars) sent.
 
 ---
 
 ## Taxonomy Tree Format in Prompts
 
-Root nodes appear as:
+Root nodes (both bulk and single-patent):
 ```
 [ROOT TAG] {node_id}: {label} — {description[:400]}
 ```
 
-Child nodes appear as:
+Child nodes:
 ```
   [TAG] {node_id}: {parent_label} > {label} — {description[:800]}
 ```
 
-Descriptions include `QUALIFYING PHRASES:` section (added by enhancement) which the
-classifier uses as direct verbatim-match targets — highest confidence signal for tagging.
+Descriptions written by enhancement contain:
+- **Root**: 1-2 sentence domain description + `[SCREEN KEYWORDS: ...]`
+- **Child**: 4-6 sentence classification guide + `QUALIFYING PHRASES: "..." | "..." | ...`
+
+The classifier reads `QUALIFYING PHRASES` as verbatim search targets — highest confidence signal.  
+The pre-screener reads `[SCREEN KEYWORDS]` to skip out-of-domain patents without any LLM call.
+
+---
+
+## Tagging Rules — Root vs Child
+
+| Node type | Tag colour (UI) | When to apply |
+|---|---|---|
+| `[ROOT TAG]` (level 0) | Yellow | Patent's primary domain clearly matches this category — requires claim evidence |
+| `[TAG]` (level > 0) | Green | Exact or near-verbatim claim language matches description/QUALIFYING PHRASES |
+
+Both root and child tags are stored in `PatentTaxonomy` table. Root tags provide broad
+classification; child tags provide specific feature classification. Both are filterable
+and exportable in the Investigation Queue UI.
 
 ---
 
@@ -207,9 +258,19 @@ classifier uses as direct verbatim-match targets — highest confidence signal f
 | Max concurrent enhance calls | 10 | `_ENHANCE_SEMAPHORE` |
 | DB commit batch size | 50 patents | `COMMIT_BATCH_SIZE` |
 | Max taxonomy tree chars | 35,000 | `MAX_TREE_CHARS` |
-| Max abstract chars | 800 | inline in classify |
-| Max claims chars | 10,000 | inline in classify |
-| Classify max_tokens | 1,500 | LLM call |
+| Max abstract chars (classify) | 800 | inline in classify |
+| Max claims chars (classify) | 10,000 | inline in classify |
+| Root desc chars in prompt | 400 | inline in tree builder |
+| Child desc chars in prompt | 800 | inline in tree builder |
+| Bulk classify max_tokens | 300 | LLM call (array output, compact) |
+| Single-patent max_tokens | 1,500 | LLM call (evidence dict output) |
 | Enhance max_tokens | 700 | LLM call |
 | Enhance temperature | 0.2 | LLM call |
 | Classify temperature | 0.0 | LLM call |
+
+## DB Flush Strategy
+
+`_flush_bulk_chunk()` uses a single bulk `INSERT ... ON CONFLICT DO NOTHING` statement
+for all tag assignments in a chunk. This replaces the previous N×M individual
+`SELECT` + `INSERT` queries (was 220+ round-trips for 44 patents with ~5 tags each,
+adding 11-22 seconds of Neon DB latency).

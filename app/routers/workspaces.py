@@ -151,6 +151,28 @@ async def remove_workspace_member(
     return {"message": "Member removed successfully"}
 
 
+@router.delete("/workspaces/{workspace_id}")
+async def delete_workspace(
+    workspace_id: str,
+    current_user: dict = Depends(require_role(["ADMIN", "admin"])),
+    db: AsyncSession = Depends(get_db),
+):
+    ws_uuid = _parse_ws_uuid(workspace_id)
+    # Delete in order: patent taxonomy → patents → taxonomy nodes → workspace users → workspace
+    pn_result = await db.scalars(select(Patent.patent_number).where(Patent.workspace_id == ws_uuid))
+    patent_numbers = list(pn_result.all())
+    if patent_numbers:
+        await db.execute(delete(PatentTaxonomy).where(PatentTaxonomy.patent_number.in_(patent_numbers)))
+    await db.execute(delete(Patent).where(Patent.workspace_id == ws_uuid))
+    await db.execute(delete(TaxonomyNode).where(TaxonomyNode.workspace_id == ws_uuid))
+    await db.execute(delete(WorkspaceUser).where(WorkspaceUser.workspace_id == ws_uuid))
+    result = await db.execute(delete(Workspace).where(Workspace.id == ws_uuid))
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return {"message": "Workspace deleted", "workspace_id": workspace_id}
+
+
 @router.delete("/workspaces/{workspace_id}/patents")
 async def empty_workspace_patents(
     workspace_id: str,

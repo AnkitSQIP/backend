@@ -83,8 +83,10 @@ MAX_CONCURRENT_LLM = 20
 _CLASSIFY_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_LLM)
 COMMIT_BATCH_SIZE = 50  # commit to DB every N patents in bulk jobs
 
-# In-memory job registry (single-worker deployment — no cross-process sharing needed)
+# In-memory job registries (single-worker deployment — no cross-process sharing needed)
 _BULK_JOBS: dict[str, dict] = {}
+_ENHANCE_JOBS: dict[str, dict] = {}
+_ENHANCE_SEMAPHORE = asyncio.Semaphore(10)  # cap concurrent enhance LLM calls
 
 
 def _passes_domain_screen(
@@ -205,15 +207,16 @@ async def _bulk_classify_task(
             tree_lines: list[str] = []
             for n in roots + children:
                 if n.parent_id and n.parent_id in node_map:
-                    desc_str = f" — {n.description}" if n.description else ""
+                    desc = (n.description or "")[:800]
+                    desc_str = f" — {desc}" if desc else ""
                     parent_label = node_map[n.parent_id].label
                     tree_lines.append(f"  [TAG] {n.node_id}: {parent_label} > {n.label}{desc_str}")
                 else:
                     tree_lines.append(f"[CATEGORY - DO NOT TAG] {n.node_id}: {n.label}")
 
             taxonomy_tree = "\n".join(tree_lines)
-            if len(taxonomy_tree) > 22000:
-                taxonomy_tree = taxonomy_tree[:22000].rsplit("\n", 1)[0]
+            if len(taxonomy_tree) > 35000:
+                taxonomy_tree = taxonomy_tree[:35000].rsplit("\n", 1)[0]
 
             roots_list = "\n".join(f"  • {n.label}" for n in roots)
             system_content = (
@@ -792,77 +795,100 @@ async def enhance_taxonomy_description(
     return {"enhanced": enhanced}
 
 
+async def _enhance_all_task(job_id: str, workspace_id: uuid.UUID) -> None:
+    """Background task: enhance ALL taxonomy node descriptions in workspace."""
+    from app.database import AsyncSessionLocal
+
+    _ENHANCE_JOBS[job_id].update({"status": "running", "done": 0, "total": 0, "enhanced": 0, "failed": 0})
+    try:
+        async with AsyncSessionLocal() as db:
+            all_nodes_result = await db.scalars(
+                select(TaxonomyNode).where(TaxonomyNode.workspace_id == workspace_id)
+            )
+            all_nodes = list(all_nodes_result.all())
+            total = len(all_nodes)
+            _ENHANCE_JOBS[job_id]["total"] = total
+            if not all_nodes:
+                _ENHANCE_JOBS[job_id]["status"] = "done"
+                return
+
+            node_map = {n.node_id: n for n in all_nodes}
+            llm = get_llm()
+
+            async def _enhance_one(node: TaxonomyNode) -> tuple:
+                node_is_root = (node.level == 0)
+                parent_label = ""
+                if node.parent_id and node.parent_id in node_map:
+                    parent_label = node_map[node.parent_id].label
+                context = f"Parent category: {parent_label}\n" if parent_label else ""
+                existing = (node.description or "").strip()
+                draft_line = f'Current description: "{existing}"\n' if existing else "No description yet.\n"
+                prompt = _build_enhance_prompt(node.label, context, draft_line, is_root=node_is_root)
+                async with _ENHANCE_SEMAPHORE:
+                    try:
+                        response = await llm.chat.completions.create(
+                            model="deepseek/deepseek-v3.2",
+                            messages=[
+                                {"role": "system", "content": _ENHANCE_SYSTEM},
+                                {"role": "user", "content": prompt},
+                            ],
+                            max_tokens=700,
+                            temperature=0.2,
+                        )
+                        result = (response.choices[0].message.content or "").strip()
+                        return node, result or None
+                    except Exception as e:
+                        logger.warning(f"Enhance job {job_id}: failed {node.node_id}: {e}")
+                        return node, None
+
+            tasks = [asyncio.ensure_future(_enhance_one(n)) for n in all_nodes]
+            for coro in asyncio.as_completed(tasks):
+                node, new_desc = await coro
+                _ENHANCE_JOBS[job_id]["done"] += 1
+                if new_desc:
+                    node.description = new_desc
+                    _ENHANCE_JOBS[job_id]["enhanced"] += 1
+                else:
+                    _ENHANCE_JOBS[job_id]["failed"] += 1
+
+            await db.commit()
+
+        _ENHANCE_JOBS[job_id]["status"] = "done"
+        logger.info(
+            f"Enhance job {job_id} done: "
+            f"{_ENHANCE_JOBS[job_id]['enhanced']} enhanced, "
+            f"{_ENHANCE_JOBS[job_id]['failed']} failed"
+        )
+    except Exception as exc:
+        logger.error(f"Enhance job {job_id} crashed: {exc}", exc_info=True)
+        _ENHANCE_JOBS[job_id].update({"status": "error", "error": str(exc)})
+
+
 @router.post("/taxonomy/enhance-all-descriptions")
 async def enhance_all_taxonomy_descriptions(
     workspace_id: str = Query(...),
     current_user: dict = Depends(require_role(["ADMIN", "admin", "ANALYST", "analyst"])),
     db: AsyncSession = Depends(get_db),
 ):
-    """Re-enhance ALL taxonomy node descriptions in a workspace using AI.
-
-    Root nodes (level=0) get a description + [SCREEN KEYWORDS: ...] for Tier-1 pre-screening.
-    Leaf nodes (level>0) get a 4-6 sentence description + QUALIFYING PHRASES for classification.
-    All nodes are processed regardless of whether they already have a description.
-    """
+    """Start background re-enhancement of ALL taxonomy node descriptions. Returns job_id immediately."""
     ws_uuid = _parse_ws_uuid(workspace_id)
+    job_id = str(uuid.uuid4())
+    _ENHANCE_JOBS[job_id] = {"status": "queued", "done": 0, "total": 0, "enhanced": 0, "failed": 0}
+    asyncio.create_task(_enhance_all_task(job_id, ws_uuid))
+    logger.info(f"Enhance job {job_id} started for workspace {workspace_id}")
+    return {"job_id": job_id, "status": "queued", "enhanced": 0, "failed": 0, "total": 0}
 
-    all_nodes_result = await db.scalars(
-        select(TaxonomyNode).where(TaxonomyNode.workspace_id == ws_uuid)
-    )
-    all_nodes = list(all_nodes_result.all())
-    node_map = {n.node_id: n for n in all_nodes}
 
-    # Enhance ALL nodes — roots get SCREEN KEYWORDS, leaves get QUALIFYING PHRASES
-    targets = all_nodes
-    if not targets:
-        return {"message": "No taxonomy nodes found", "enhanced": 0, "failed": 0}
-
-    llm = get_llm()
-
-    async def _enhance_one(node: TaxonomyNode) -> tuple[TaxonomyNode, str | None]:
-        node_is_root = (node.level == 0)
-        parent_label = ""
-        if node.parent_id and node.parent_id in node_map:
-            parent_label = node_map[node.parent_id].label
-        context = f"Parent category: {parent_label}\n" if parent_label else ""
-        existing = (node.description or "").strip()
-        draft_line = f'Current description: "{existing}"\n' if existing else "No description yet.\n"
-        prompt = _build_enhance_prompt(node.label, context, draft_line, is_root=node_is_root)
-        try:
-            response = await llm.chat.completions.create(
-                model="deepseek/deepseek-v3.2",
-                messages=[
-                    {"role": "system", "content": _ENHANCE_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=700,
-                temperature=0.2,
-            )
-            result = (response.choices[0].message.content or "").strip()
-            return node, result or None
-        except Exception as e:
-            logger.warning(f"Failed to enhance {node.node_id} ({node.label}): {e}")
-            return node, None
-
-    results = await asyncio.gather(*[_enhance_one(n) for n in targets])
-
-    enhanced_count = 0
-    failed_count = 0
-    for node, new_desc in results:
-        if new_desc:
-            node.description = new_desc
-            enhanced_count += 1
-        else:
-            failed_count += 1
-
-    await db.commit()
-    logger.info(f"Bulk enhance complete: {enhanced_count} enhanced, {failed_count} failed (total={len(targets)})")
-    return {
-        "message": f"Enhanced {enhanced_count} descriptions ({len([n for n in targets if n.level == 0])} root + {len([n for n in targets if n.level > 0])} leaf nodes)",
-        "enhanced": enhanced_count,
-        "failed": failed_count,
-        "total": len(targets),
-    }
+@router.get("/taxonomy/enhance-all-descriptions/{job_id}")
+async def get_enhance_job_status(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Poll status of an enhance-all job."""
+    job = _ENHANCE_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Enhance job not found")
+    return job
 
 
 # ── AI TAXONOMY GENERATION ────────────────────────────────────────────────────
@@ -1035,16 +1061,17 @@ async def ai_suggest_taxonomy(
     tree_lines: list[str] = []
     for n in ordered_nodes:
         if n.parent_id and n.parent_id in node_map:
-            # Leaf TAG nodes: include full description (with QUALIFYING PHRASES) for the LLM
-            desc_str = f" — {n.description}" if n.description else ""
+            # Leaf TAG nodes: cap description at 800 chars to prevent tree bloat
+            desc = (n.description or "")[:800]
+            desc_str = f" — {desc}" if desc else ""
             parent_label = node_map[n.parent_id].label
             tree_lines.append(f"  [TAG] {n.node_id}: {parent_label} > {n.label}{desc_str}")
         else:
             # Root CATEGORY nodes: label only — [SCREEN KEYWORDS] are for pre-screening, not the LLM
             tree_lines.append(f"[CATEGORY - DO NOT TAG] {n.node_id}: {n.label}")
 
-    # Token budget guard: cap taxonomy at ~22000 chars
-    MAX_TREE_CHARS = 22000
+    # DeepSeek V3.2 has 163k context — 35000 chars is safe
+    MAX_TREE_CHARS = 35000
     taxonomy_tree = "\n".join(tree_lines)
     if len(taxonomy_tree) > MAX_TREE_CHARS:
         truncated = taxonomy_tree[:MAX_TREE_CHARS].rsplit("\n", 1)[0]

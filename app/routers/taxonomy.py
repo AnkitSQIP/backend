@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Form, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.models import TaxonomyNode, PatentTaxonomy, Patent
 from app.deps import get_db, get_current_user, require_role
@@ -133,30 +134,31 @@ async def _flush_bulk_chunk(
     node_label_map: dict[str, str],
     user_email: str,
 ) -> None:
-    """Write a chunk of classified patents to DB and commit."""
+    """Write a chunk of classified patents to DB using bulk upsert — no N+1 queries."""
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
+
+    # Collect all tag rows to insert in one bulk statement
+    tag_rows: list[dict] = []
     for patent, tag_ids in buffer:
         if tag_ids is None:
             continue  # LLM failure — leave as pending
         if tag_ids:
             for nid in tag_ids:
-                exists = await db.scalar(
-                    select(PatentTaxonomy).where(
-                        PatentTaxonomy.patent_number == patent.patent_number,
-                        PatentTaxonomy.taxonomy_node_id == nid,
-                    )
-                )
-                if not exists:
-                    db.add(PatentTaxonomy(
-                        patent_number=patent.patent_number,
-                        taxonomy_node_id=nid,
-                        taxonomy_label=node_label_map.get(nid, ""),
-                        assigned_by=f"ai_bulk:{user_email}",
-                    ))
+                tag_rows.append({
+                    "patent_number": patent.patent_number,
+                    "taxonomy_node_id": nid,
+                    "taxonomy_label": node_label_map.get(nid, ""),
+                    "assigned_by": f"ai_bulk:{user_email}",
+                })
             patent.review_status = "reviewed"
             patent.reviewed_at = now
-        # no_match (empty list): leave as pending
+
+    # Single bulk INSERT ... ON CONFLICT DO NOTHING — replaces N×M individual queries
+    if tag_rows:
+        stmt = pg_insert(PatentTaxonomy).values(tag_rows).on_conflict_do_nothing()
+        await db.execute(stmt)
+
     await db.commit()
 
 

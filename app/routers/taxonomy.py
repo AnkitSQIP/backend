@@ -212,7 +212,9 @@ async def _bulk_classify_task(
                     parent_label = node_map[n.parent_id].label
                     tree_lines.append(f"  [TAG] {n.node_id}: {parent_label} > {n.label}{desc_str}")
                 else:
-                    tree_lines.append(f"[CATEGORY - DO NOT TAG] {n.node_id}: {n.label}")
+                    desc = (n.description or "")[:400]
+                    desc_str = f" — {desc}" if desc else ""
+                    tree_lines.append(f"[ROOT TAG] {n.node_id}: {n.label}{desc_str}")
 
             taxonomy_tree = "\n".join(tree_lines)
             if len(taxonomy_tree) > 35000:
@@ -223,12 +225,12 @@ async def _bulk_classify_task(
                 "You are an expert patent classifier performing multi-label taxonomy classification.\n"
                 "Output ONLY a valid JSON object: {\"evidence\":{...},\"tags\":[...]}.\n"
                 "Rules:\n"
-                "• Only use IDs from [TAG] entries — never [CATEGORY] IDs or invented IDs.\n"
-                "• Every tag must be backed by a direct claim quote in the evidence dict.\n"
+                "• Use IDs from both [ROOT TAG] and [TAG] entries — never invented IDs.\n"
+                "• [ROOT TAG]: apply only when patent's primary subject clearly falls under this broad category with direct claim evidence.\n"
+                "• [TAG]: apply only when you can quote exact claim language matching its description.\n"
+                "• Every tag (root or child) must have a direct claim quote in the evidence dict.\n"
                 "• Check ALL claims (independent + dependent) before deciding on each tag.\n"
-                "• Material tags: the named material must apply to the correct device component.\n"
-                "• Mechanism tags: require an explicitly named structural element, not implied behavior.\n"
-                "• Delivery tags: primary independent claim must BE the delivery component.\n"
+                "• Never tag from abstract, background, or prior art — claims only.\n"
                 "• When uncertain: NO is correct. Zero tags is acceptable; wrong tags are not.\n"
                 "• No text outside the JSON object."
             )
@@ -274,8 +276,9 @@ async def _bulk_classify_task(
                     f"     that are where secondary tags often live.\n"
                     f"  d. Decide YES (you can quote a claim sentence) or NO (not found or ambiguous).\n\n"
                     f"TAXONOMY:\n"
-                    f"[CATEGORY - DO NOT TAG] = grouping only — NEVER return these IDs.\n"
-                    f"[TAG] = only these IDs may appear in your output.\n"
+                    f"[ROOT TAG] = broad category tag — apply ONLY when the patent's primary subject matter clearly falls under this category. Requires direct claim evidence, not just topical relevance.\n"
+                    f"[TAG] = specific child tag — apply when you can quote exact claim language matching the description.\n"
+                    f"Both [ROOT TAG] and [TAG] IDs may appear in your output.\n"
                     f"{taxonomy_tree}\n\n"
                     f"━━━ STEP 3: PRECISION FILTER ━━━\n"
                     f"Remove a YES tag if ANY of these apply:\n"
@@ -320,7 +323,7 @@ async def _bulk_classify_task(
                 finish_reason = getattr(choice, "finish_reason", "stop") or "stop"
                 content = (choice.message.content or "").strip()
                 raw_ids = _safe_parse_id_array(content, finish_reason, patent_number=patent.patent_number)
-                tag_ids = [nid for nid in raw_ids if nid in id_to_node and id_to_node[nid].level > 0]
+                tag_ids = [nid for nid in raw_ids if nid in id_to_node]
                 return patent, tag_ids
 
             # Launch all patent tasks — semaphore caps concurrency at MAX_CONCURRENT_LLM
@@ -1061,14 +1064,14 @@ async def ai_suggest_taxonomy(
     tree_lines: list[str] = []
     for n in ordered_nodes:
         if n.parent_id and n.parent_id in node_map:
-            # Leaf TAG nodes: cap description at 800 chars to prevent tree bloat
             desc = (n.description or "")[:800]
             desc_str = f" — {desc}" if desc else ""
             parent_label = node_map[n.parent_id].label
             tree_lines.append(f"  [TAG] {n.node_id}: {parent_label} > {n.label}{desc_str}")
         else:
-            # Root CATEGORY nodes: label only — [SCREEN KEYWORDS] are for pre-screening, not the LLM
-            tree_lines.append(f"[CATEGORY - DO NOT TAG] {n.node_id}: {n.label}")
+            desc = (n.description or "")[:400]
+            desc_str = f" — {desc}" if desc else ""
+            tree_lines.append(f"[ROOT TAG] {n.node_id}: {n.label}{desc_str}")
 
     # DeepSeek V3.2 has 163k context — 35000 chars is safe
     MAX_TREE_CHARS = 35000
@@ -1115,17 +1118,19 @@ async def ai_suggest_taxonomy(
         f"→ If NONE apply → return {{\"evidence\":{{}},\"tags\":[]}} immediately.\n"
         f"→ If YES → continue to Step 2.\n\n"
         f"━━━ STEP 2: PER-TAG EVALUATION ━━━\n"
-        f"For EVERY [TAG] listed in the taxonomy below:\n"
-        f"  a. Read its Description to understand what evidence qualifies.\n"
-        f"  b. If Description contains 'QUALIFYING PHRASES:', search the patent claims for those\n"
-        f"     exact phrases first — a verbatim or near-verbatim match is strong evidence.\n"
-        f"  c. IMPORTANT: Check EVERY claim — independent AND dependent.\n"
-        f"     Dependent claims contain material types, mechanisms, and functional details\n"
-        f"     that are where secondary tags often live.\n"
-        f"  d. Decide YES (you can quote a claim sentence) or NO (not found or ambiguous).\n\n"
+        f"Evaluate EVERY node in the taxonomy below — both [ROOT TAG] and [TAG]:\n"
+        f"  a. For [ROOT TAG]: apply if the patent's primary subject clearly belongs to this broad category.\n"
+        f"     Use the root description + its children's descriptions to understand the domain scope.\n"
+        f"     Require at least one claim that directly addresses the root category's domain.\n"
+        f"  b. For [TAG]: apply only when you can quote exact or near-verbatim claim language matching\n"
+        f"     the description. If 'QUALIFYING PHRASES:' present, match those first.\n"
+        f"  c. Check EVERY claim — independent AND dependent.\n"
+        f"     Dependent claims contain material types, mechanisms, and functional details.\n"
+        f"  d. Decide YES (can quote claim) or NO (not found or ambiguous).\n\n"
         f"TAXONOMY:\n"
-        f"[CATEGORY - DO NOT TAG] = grouping only — NEVER return these IDs.\n"
-        f"[TAG] = only these IDs may appear in your output.\n"
+        f"[ROOT TAG] = broad category — apply when patent primarily operates in this domain (needs claim evidence).\n"
+        f"[TAG] = specific child tag — apply when exact claim language matches.\n"
+        f"Both may appear in output. Never return invented IDs.\n"
         f"{taxonomy_tree}\n\n"
         f"━━━ STEP 3: PRECISION FILTER ━━━\n"
         f"Remove a YES tag if ANY of these apply:\n"
@@ -1191,22 +1196,18 @@ async def ai_suggest_taxonomy(
 
     raw_ids = _safe_parse_id_array(content, finish_reason, patent_number=patent_number)
 
-    # ── Strict whitelist: only leaf IDs (level > 0) that exist in this workspace's taxonomy.
-    # Root/category nodes (level == 0) are groupings and must never be applied as patent tags.
-    # This eliminates both hallucinated IDs and any root-node IDs the model may have returned.
     id_to_label = {n.node_id: n.label for n in all_nodes}
     id_to_node = {n.node_id: n for n in all_nodes}
+    # Allow both root and child nodes — filter only hallucinated IDs not in taxonomy
     suggestions = [
         {"node_id": nid, "label": id_to_label[nid]}
         for nid in raw_ids
-        if nid in id_to_label and id_to_node[nid].level > 0
+        if nid in id_to_label
     ]
 
-    # Log root-node returns separately from hallucinations
-    root_ids = [nid for nid in raw_ids if nid in id_to_label and id_to_node[nid].level == 0]
-    if root_ids:
+    if False:  # kept for diff visibility
         logger.warning(
-            f"AI returned {len(root_ids)} root/category node ID(s) for {patent_number} — discarded: {root_ids}"
+            f"Placeholder"
         )
     hallucinated = [nid for nid in raw_ids if nid not in id_to_label]
     if hallucinated:

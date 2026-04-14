@@ -386,13 +386,15 @@ async def list_investigation_queue(
     # Batch-load taxonomy labels in ONE query (eliminates N per-patent API calls)
     from collections import defaultdict
     tax_map: dict[str, list[str]] = defaultdict(list)
+    tax_id_map: dict[str, list[str]] = defaultdict(list)
     if patents:
         pnums = [p.patent_number for p in patents]
-        tax_rows = await db.scalars(
+        tax_rows = list((await db.scalars(
             select(PatentTaxonomy).where(PatentTaxonomy.patent_number.in_(pnums))
-        )
+        )).all())
         for t in tax_rows:
             tax_map[t.patent_number].append(t.taxonomy_label or "")
+            tax_id_map[t.patent_number].append(t.taxonomy_node_id or "")
 
     return {
         "queue": [
@@ -414,6 +416,7 @@ async def list_investigation_queue(
                 "reviewed_at": p.reviewed_at.isoformat() if p.reviewed_at else None,
                 "workspace_id": str(p.workspace_id),
                 "taxonomy_labels": tax_map[p.patent_number],
+                "taxonomy_node_ids": tax_id_map[p.patent_number],
             }
             for p in patents
         ],

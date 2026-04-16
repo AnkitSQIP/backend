@@ -94,6 +94,9 @@ _ENHANCE_SEMAPHORE = asyncio.Semaphore(10)  # cap concurrent enhance LLM calls
 # Cancellation flags: job_id → True means "stop after current page"
 _BULK_JOB_CANCELLED: dict[str, bool] = {}
 
+# Credit-limit sentinel — returned by classify_one when OpenRouter 403 "Key limit exceeded"
+_CREDIT_LIMIT = "CREDIT_LIMIT"
+
 # SSE queues: job_id → asyncio.Queue — background task pushes events, SSE endpoint drains them
 # One queue per active SSE connection; None if no client is listening.
 _BULK_JOB_QUEUES: dict[str, asyncio.Queue] = {}
@@ -329,6 +332,11 @@ async def _bulk_classify_task(
                         last_exc = None
                         break
                     except Exception as e:
+                        err_str = str(e)
+                        # 403 "Key limit exceeded" — no point retrying, signal caller immediately
+                        if "Key limit exceeded" in err_str or ("403" in err_str and "limit" in err_str.lower()):
+                            logger.error(f"OpenRouter credit/key limit hit: {e}")
+                            return patent, _CREDIT_LIMIT
                         last_exc = e
                         logger.warning(f"Bulk LLM attempt {attempt+1}/3 for {patent.patent_number}: {e}")
                         if attempt < 2:
@@ -375,8 +383,19 @@ async def _bulk_classify_task(
                 tasks = [asyncio.ensure_future(classify_one(p)) for p in page_patents]
                 commit_buffer: list[tuple] = []
 
+                credit_limit_hit = False
                 for coro in asyncio.as_completed(tasks):
                     patent, tag_ids = await coro
+
+                    # Credit limit — flush whatever was processed, then stop everything
+                    if tag_ids is _CREDIT_LIMIT:
+                        logger.error(f"Job {job_id}: OpenRouter credit limit hit — flushing {len(commit_buffer)} buffered patents and stopping")
+                        if commit_buffer:
+                            await _flush_bulk_chunk(db, commit_buffer, node_label_map, user_email)
+                            commit_buffer.clear()
+                        credit_limit_hit = True
+                        break
+
                     commit_buffer.append((patent, tag_ids))
 
                     if tag_ids is None:
@@ -408,9 +427,23 @@ async def _bulk_classify_task(
                             f"{_BULK_JOBS[job_id]['tagged']} tagged"
                         )
 
+                if credit_limit_hit:
+                    _BULK_JOBS[job_id].update({
+                        "status": "credit_limit_error",
+                        "error": "OpenRouter credit/key limit exceeded. Please top up at openrouter.ai/settings/keys",
+                    })
+                    sse_q = _BULK_JOB_QUEUES.pop(job_id, None)
+                    if sse_q:
+                        sse_q.put_nowait({**_BULK_JOBS[job_id], "total": total})
+                    _BULK_JOB_CANCELLED[job_id] = True  # prevent further pages
+                    break  # exit page loop
+
                 if commit_buffer:
                     await _flush_bulk_chunk(db, commit_buffer, node_label_map, user_email)
             # Page session closed — connection returned to pool before next page starts
+
+            if _BULK_JOB_CANCELLED.get(job_id):
+                break  # credit_limit or user cancel already set status above
 
         _BULK_JOBS[job_id]["status"] = "done"
         logger.info(

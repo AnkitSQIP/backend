@@ -91,6 +91,9 @@ _BULK_JOBS: dict[str, dict] = {}
 _ENHANCE_JOBS: dict[str, dict] = {}
 _ENHANCE_SEMAPHORE = asyncio.Semaphore(10)  # cap concurrent enhance LLM calls
 
+# Cancellation flags: job_id → True means "stop after current page"
+_BULK_JOB_CANCELLED: dict[str, bool] = {}
+
 # SSE queues: job_id → asyncio.Queue — background task pushes events, SSE endpoint drains them
 # One queue per active SSE connection; None if no client is listening.
 _BULK_JOB_QUEUES: dict[str, asyncio.Queue] = {}
@@ -346,6 +349,16 @@ async def _bulk_classify_task(
         # 500 patents per page → 20 concurrent LLM calls via semaphore.
         # Memory stays flat: never more than 500 Patent objects in RAM at once.
         for page_start in range(0, total, PATENT_PAGE_SIZE):
+            # Check cancellation before starting each new page
+            if _BULK_JOB_CANCELLED.get(job_id):
+                logger.info(f"Job {job_id}: cancelled by user after {_BULK_JOBS[job_id]['done']}/{total} patents")
+                _BULK_JOBS[job_id]["status"] = "cancelled"
+                sse_q = _BULK_JOB_QUEUES.pop(job_id, None)
+                if sse_q:
+                    sse_q.put_nowait({**_BULK_JOBS[job_id], "total": total})
+                _BULK_JOB_CANCELLED.pop(job_id, None)
+                return
+
             page_ids = all_pending_ids[page_start : page_start + PATENT_PAGE_SIZE]
 
             async with AsyncSessionLocal() as db:
@@ -432,6 +445,22 @@ async def start_bulk_classify(
     asyncio.create_task(_bulk_classify_task(job_id, ws_uuid, include_claims, user_email))
     logger.info(f"Bulk classify job {job_id} started for workspace {workspace_id} by {user_email}")
     return {"job_id": job_id, "status": "queued"}
+
+
+@router.post("/taxonomy/classify-workspace/{job_id}/cancel")
+async def cancel_bulk_classify(
+    job_id: str,
+    current_user: dict = Depends(require_role(["ADMIN", "admin", "ANALYST", "analyst"])),
+):
+    """Signal the background job to stop after the current page finishes.
+    Already-processed patents remain saved. No new LLM calls are started."""
+    job = _BULK_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") not in ("running", "queued"):
+        return {"message": "Job already finished", "status": job.get("status")}
+    _BULK_JOB_CANCELLED[job_id] = True
+    return {"message": "Cancel signal sent — job will stop after current page", "job_id": job_id}
 
 
 @router.get("/taxonomy/classify-workspace/{job_id}")

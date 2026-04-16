@@ -3,8 +3,9 @@ import uuid
 import logging
 import json
 import re
+import io
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Form, Query
+from fastapi import APIRouter, Depends, HTTPException, Form, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, update, func
@@ -564,6 +565,163 @@ async def stream_classify_progress(
             "Transfer-Encoding": "chunked",
         },
     )
+
+
+# ── TAXONOMY IMPORT ───────────────────────────────────────────────────────────
+
+@router.post("/taxonomy/import-from-workspace")
+async def import_taxonomy_from_workspace(
+    source_workspace_id: str = Form(...),
+    target_workspace_id: str = Form(...),
+    current_user: dict = Depends(require_role(["ADMIN", "admin", "ANALYST", "analyst"])),
+    db: AsyncSession = Depends(get_db),
+):
+    """Copy all taxonomy nodes (with descriptions) from source → target workspace.
+    New node_ids are generated to avoid collisions. Parent/child relationships preserved."""
+    src_uuid = _parse_ws_uuid(source_workspace_id)
+    tgt_uuid = _parse_ws_uuid(target_workspace_id)
+    if src_uuid == tgt_uuid:
+        raise HTTPException(status_code=400, detail="Source and target workspace must be different")
+
+    src_nodes = list((await db.scalars(
+        select(TaxonomyNode).where(TaxonomyNode.workspace_id == src_uuid)
+    )).all())
+    if not src_nodes:
+        return {"created": 0, "message": "Source workspace has no taxonomy nodes"}
+
+    # Map old_id → new_id so we can re-wire parent_id references
+    id_map: dict[str, str] = {n.node_id: str(uuid.uuid4())[:8] for n in src_nodes}
+
+    # Sort: roots first, then children (so parent exists when child is inserted)
+    roots = [n for n in src_nodes if not n.parent_id or n.parent_id not in {x.node_id for x in src_nodes}]
+    children = [n for n in src_nodes if n not in roots]
+    ordered = roots + children
+
+    created = 0
+    for node in ordered:
+        new_id = id_map[node.node_id]
+        new_parent = id_map.get(node.parent_id) if node.parent_id else None
+        db.add(TaxonomyNode(
+            node_id=new_id,
+            label=node.label,
+            description=node.description,
+            workspace_id=tgt_uuid,
+            parent_id=new_parent,
+            level=node.level,
+        ))
+        created += 1
+
+    await db.commit()
+    logger.info(f"Imported {created} taxonomy nodes from workspace {source_workspace_id} → {target_workspace_id}")
+    return {"created": created, "message": f"Imported {created} taxonomy nodes"}
+
+
+def _find_col_fuzzy(columns: list[str], keywords: list[str]) -> Optional[str]:
+    """Find a column by keyword matching (case-insensitive partial match)."""
+    for col in columns:
+        col_lower = col.lower()
+        if any(kw.lower() in col_lower for kw in keywords):
+            return col
+    return None
+
+
+@router.post("/taxonomy/import-from-file")
+async def import_taxonomy_from_file(
+    file: UploadFile = File(...),
+    workspace_id: str = Form(...),
+    current_user: dict = Depends(require_role(["ADMIN", "admin", "ANALYST", "analyst"])),
+    db: AsyncSession = Depends(get_db),
+):
+    """Import taxonomy from CSV/Excel file.
+
+    Expected columns (detected by keyword, order doesn't matter):
+    - Root category column: contains 'core', 'category', or 'root'
+    - Child label column: contains 'feature', 'requirement', or 'name'
+    - Description column: contains 'description' or 'desc'
+    """
+    import pandas as pd
+
+    ws_uuid = _parse_ws_uuid(workspace_id)
+    content = await file.read()
+    fname = file.filename or ""
+
+    try:
+        if fname.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(content))
+        else:
+            df = pd.read_excel(io.BytesIO(content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse file: {e}")
+
+    cols = list(df.columns)
+    root_col = _find_col_fuzzy(cols, ["core", "category", "root", "parent"])
+    child_col = _find_col_fuzzy(cols, ["feature", "requirement", "child", "name", "label"])
+    desc_col  = _find_col_fuzzy(cols, ["description", "desc", "detail"])
+
+    if not root_col:
+        raise HTTPException(status_code=400, detail=f"Could not find root category column. Columns found: {cols}")
+    if not child_col:
+        raise HTTPException(status_code=400, detail=f"Could not find child/feature column. Columns found: {cols}")
+
+    # Build tree: root_label → [(child_label, description)]
+    from collections import defaultdict
+    root_children: dict[str, list[tuple[str, str]]] = defaultdict(list)
+
+    for _, row in df.iterrows():
+        root_val = row.get(root_col)
+        child_val = row.get(child_col)
+        desc_val  = row.get(desc_col) if desc_col else ""
+
+        if root_val is None or (hasattr(root_val, '__class__') and root_val.__class__.__name__ == 'float'):
+            continue
+        try:
+            import pandas as _pd
+            if _pd.isna(root_val):
+                continue
+        except Exception:
+            pass
+
+        root_str  = str(root_val).strip()
+        child_str = str(child_val).strip() if child_val is not None and str(child_val) != "nan" else ""
+        desc_str  = str(desc_val).strip()  if desc_val  is not None and str(desc_val)  != "nan" else ""
+
+        if root_str:
+            if child_str:
+                root_children[root_str].append((child_str, desc_str))
+            else:
+                # Row is just a root with no child — ensure root is created
+                if root_str not in root_children:
+                    root_children[root_str] = []
+
+    if not root_children:
+        raise HTTPException(status_code=400, detail="No data rows found in file")
+
+    created = 0
+    for root_label, children in root_children.items():
+        root_id = str(uuid.uuid4())[:8]
+        db.add(TaxonomyNode(
+            node_id=root_id,
+            label=root_label,
+            workspace_id=ws_uuid,
+            parent_id=None,
+            level=0,
+        ))
+        created += 1
+        for child_label, child_desc in children:
+            child_id = str(uuid.uuid4())[:8]
+            db.add(TaxonomyNode(
+                node_id=child_id,
+                label=child_label,
+                description=child_desc if child_desc else None,
+                workspace_id=ws_uuid,
+                parent_id=root_id,
+                level=1,
+            ))
+            created += 1
+
+    await db.commit()
+    logger.info(f"Imported {created} taxonomy nodes from file into workspace {workspace_id}")
+    return {"created": created, "roots": len(root_children), "message": f"Imported {len(root_children)} root categories and {created - len(root_children)} child nodes"}
 
 
 # ── TAXONOMY NODES ────────────────────────────────────────────────────────────

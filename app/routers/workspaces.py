@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete, outerjoin
-from app.models import Workspace, WorkspaceUser, Patent, PatentTaxonomy, TaxonomyNode, User
+from app.models import Workspace, WorkspaceUser, Patent, PatentTaxonomy, TaxonomyNode, User, WatchlistRule, WatchlistAlert, InvestigationQueueItem
 from app.deps import get_db, get_current_user, require_role
 
 logger = logging.getLogger(__name__)
@@ -166,12 +166,29 @@ async def delete_workspace(
     db: AsyncSession = Depends(get_db),
 ):
     ws_uuid = _parse_ws_uuid(workspace_id)
-    # Delete in order: patent taxonomy → patents → taxonomy nodes → workspace users → workspace
+    # Delete in FK-safe order:
+    # 1. WatchlistAlerts (references workspace)
+    # 2. WatchlistRules (references workspace)
+    # 3. InvestigationQueueItems (references workspace)
+    # 4. PatentTaxonomy (references patent_number + taxonomy_node_id)
+    # 5. Patents (references workspace)
+    # 6. TaxonomyNode children (level > 0, references parent node_id)
+    # 7. TaxonomyNode roots (level == 0)
+    # 8. WorkspaceUsers (references workspace)
+    # 9. Workspace
+    await db.execute(delete(WatchlistAlert).where(WatchlistAlert.workspace_id == ws_uuid))
+    await db.execute(delete(WatchlistRule).where(WatchlistRule.workspace_id == ws_uuid))
+    await db.execute(delete(InvestigationQueueItem).where(InvestigationQueueItem.workspace_id == ws_uuid))
     pn_result = await db.scalars(select(Patent.patent_number).where(Patent.workspace_id == ws_uuid))
     patent_numbers = list(pn_result.all())
-    if patent_numbers:
-        await db.execute(delete(PatentTaxonomy).where(PatentTaxonomy.patent_number.in_(patent_numbers)))
+    # Chunk IN clause to avoid DB parameter limits on large workspaces
+    CHUNK = 500
+    for i in range(0, len(patent_numbers), CHUNK):
+        chunk = patent_numbers[i:i+CHUNK]
+        await db.execute(delete(PatentTaxonomy).where(PatentTaxonomy.patent_number.in_(chunk)))
     await db.execute(delete(Patent).where(Patent.workspace_id == ws_uuid))
+    # Delete children before parents (parent_id FK)
+    await db.execute(delete(TaxonomyNode).where(TaxonomyNode.workspace_id == ws_uuid, TaxonomyNode.parent_id.isnot(None)))
     await db.execute(delete(TaxonomyNode).where(TaxonomyNode.workspace_id == ws_uuid))
     await db.execute(delete(WorkspaceUser).where(WorkspaceUser.workspace_id == ws_uuid))
     result = await db.execute(delete(Workspace).where(Workspace.id == ws_uuid))

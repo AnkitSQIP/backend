@@ -569,6 +569,15 @@ async def stream_classify_progress(
 
 # ── TAXONOMY IMPORT ───────────────────────────────────────────────────────────
 
+def _build_conflict_response(node_id: str, label: str, existing_desc: str, incoming_desc: str) -> dict:
+    return {
+        "node_id": node_id,
+        "label": label,
+        "existing_description": existing_desc or "",
+        "incoming_description": incoming_desc or "",
+    }
+
+
 @router.post("/taxonomy/import-from-workspace")
 async def import_taxonomy_from_workspace(
     source_workspace_id: str = Form(...),
@@ -576,8 +585,9 @@ async def import_taxonomy_from_workspace(
     current_user: dict = Depends(require_role(["ADMIN", "admin", "ANALYST", "analyst"])),
     db: AsyncSession = Depends(get_db),
 ):
-    """Copy all taxonomy nodes (with descriptions) from source → target workspace.
-    New node_ids are generated to avoid collisions. Parent/child relationships preserved."""
+    """Copy taxonomy nodes from source → target workspace.
+    Exact duplicates (same label + same description) are silently skipped.
+    Conflicts (same label, different description) are returned for user resolution."""
     src_uuid = _parse_ws_uuid(source_workspace_id)
     tgt_uuid = _parse_ws_uuid(target_workspace_id)
     if src_uuid == tgt_uuid:
@@ -587,33 +597,61 @@ async def import_taxonomy_from_workspace(
         select(TaxonomyNode).where(TaxonomyNode.workspace_id == src_uuid)
     )).all())
     if not src_nodes:
-        return {"created": 0, "message": "Source workspace has no taxonomy nodes"}
+        return {"created_roots": 0, "created_children": 0, "exact_duplicates": 0, "conflicts": []}
 
-    # Map old_id → new_id so we can re-wire parent_id references
-    id_map: dict[str, str] = {n.node_id: str(uuid.uuid4())[:8] for n in src_nodes}
+    # Existing nodes in target workspace — key by label (case-insensitive)
+    tgt_nodes = list((await db.scalars(
+        select(TaxonomyNode).where(TaxonomyNode.workspace_id == tgt_uuid)
+    )).all())
+    tgt_by_label = {n.label.strip().lower(): n for n in tgt_nodes}
 
-    # Sort: roots first, then children (so parent exists when child is inserted)
-    roots = [n for n in src_nodes if not n.parent_id or n.parent_id not in {x.node_id for x in src_nodes}]
-    children = [n for n in src_nodes if n not in roots]
-    ordered = roots + children
+    id_map: dict[str, str] = {}
+    src_all_ids = {n.node_id for n in src_nodes}
+    roots_src = [n for n in src_nodes if not n.parent_id or n.parent_id not in src_all_ids]
+    children_src = [n for n in src_nodes if n not in roots_src]
+    ordered = roots_src + children_src
 
-    created = 0
+    created_roots = created_children = exact_dupes = 0
+    conflicts: list[dict] = []
+
     for node in ordered:
-        new_id = id_map[node.node_id]
-        new_parent = id_map.get(node.parent_id) if node.parent_id else None
-        db.add(TaxonomyNode(
-            node_id=new_id,
-            label=node.label,
-            description=node.description,
-            workspace_id=tgt_uuid,
-            parent_id=new_parent,
-            level=node.level,
-        ))
-        created += 1
+        lbl_key = node.label.strip().lower()
+        existing = tgt_by_label.get(lbl_key)
+        if existing:
+            ex_desc = (existing.description or "").strip()
+            in_desc = (node.description or "").strip()
+            if ex_desc == in_desc:
+                # Exact duplicate — skip silently, reuse existing id for child wiring
+                id_map[node.node_id] = existing.node_id
+                exact_dupes += 1
+            else:
+                # Conflict — same label, different description
+                conflicts.append(_build_conflict_response(existing.node_id, node.label, ex_desc, in_desc))
+                id_map[node.node_id] = existing.node_id
+        else:
+            new_id = str(uuid.uuid4())[:8]
+            id_map[node.node_id] = new_id
+            new_parent = id_map.get(node.parent_id) if node.parent_id else None
+            db.add(TaxonomyNode(
+                node_id=new_id,
+                label=node.label,
+                description=node.description,
+                workspace_id=tgt_uuid,
+                parent_id=new_parent,
+                level=node.level,
+            ))
+            if node.level == 0:
+                created_roots += 1
+            else:
+                created_children += 1
 
     await db.commit()
-    logger.info(f"Imported {created} taxonomy nodes from workspace {source_workspace_id} → {target_workspace_id}")
-    return {"created": created, "message": f"Imported {created} taxonomy nodes"}
+    return {
+        "created_roots": created_roots,
+        "created_children": created_children,
+        "exact_duplicates": exact_dupes,
+        "conflicts": conflicts,
+    }
 
 
 def _find_col_fuzzy(columns: list[str], keywords: list[str]) -> Optional[str]:
@@ -696,32 +734,86 @@ async def import_taxonomy_from_file(
     if not root_children:
         raise HTTPException(status_code=400, detail="No data rows found in file")
 
-    created = 0
+    # Load existing nodes for duplicate/conflict detection
+    existing_nodes = list((await db.scalars(
+        select(TaxonomyNode).where(TaxonomyNode.workspace_id == ws_uuid)
+    )).all())
+    existing_by_label = {n.label.strip().lower(): n for n in existing_nodes}
+
+    created_roots = created_children = exact_dupes = 0
+    conflicts: list[dict] = []
+
     for root_label, children in root_children.items():
-        root_id = str(uuid.uuid4())[:8]
-        db.add(TaxonomyNode(
-            node_id=root_id,
-            label=root_label,
-            workspace_id=ws_uuid,
-            parent_id=None,
-            level=0,
-        ))
-        created += 1
-        for child_label, child_desc in children:
-            child_id = str(uuid.uuid4())[:8]
+        root_key = root_label.strip().lower()
+        existing_root = existing_by_label.get(root_key)
+
+        if existing_root:
+            # Root exists — check description conflict
+            ex_desc = (existing_root.description or "").strip()
+            # Root nodes from file have no description in this format, so no conflict on root
+            root_id = existing_root.node_id
+            exact_dupes += 1  # root itself is a duplicate
+        else:
+            root_id = str(uuid.uuid4())[:8]
             db.add(TaxonomyNode(
-                node_id=child_id,
-                label=child_label,
-                description=child_desc if child_desc else None,
+                node_id=root_id,
+                label=root_label,
                 workspace_id=ws_uuid,
-                parent_id=root_id,
-                level=1,
+                parent_id=None,
+                level=0,
             ))
-            created += 1
+            created_roots += 1
+
+        for child_label, child_desc in children:
+            child_key = child_label.strip().lower()
+            existing_child = existing_by_label.get(child_key)
+            if existing_child:
+                ex_desc = (existing_child.description or "").strip()
+                in_desc = child_desc.strip()
+                if ex_desc == in_desc:
+                    exact_dupes += 1
+                else:
+                    conflicts.append(_build_conflict_response(existing_child.node_id, child_label, ex_desc, in_desc))
+            else:
+                child_id = str(uuid.uuid4())[:8]
+                db.add(TaxonomyNode(
+                    node_id=child_id,
+                    label=child_label,
+                    description=child_desc if child_desc else None,
+                    workspace_id=ws_uuid,
+                    parent_id=root_id,
+                    level=1,
+                ))
+                created_children += 1
 
     await db.commit()
-    logger.info(f"Imported {created} taxonomy nodes from file into workspace {workspace_id}")
-    return {"created": created, "roots": len(root_children), "message": f"Imported {len(root_children)} root categories and {created - len(root_children)} child nodes"}
+    logger.info(f"File import into {workspace_id}: {created_roots} roots, {created_children} children, {exact_dupes} dupes, {len(conflicts)} conflicts")
+    return {
+        "created_roots": created_roots,
+        "created_children": created_children,
+        "exact_duplicates": exact_dupes,
+        "conflicts": conflicts,
+    }
+
+
+@router.post("/taxonomy/import-resolve-conflict")
+async def resolve_import_conflict(
+    node_id: str = Form(...),
+    description: str = Form(...),
+    workspace_id: str = Form(...),
+    current_user: dict = Depends(require_role(["ADMIN", "admin", "ANALYST", "analyst"])),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replace existing node's description with incoming description (user chose Replace)."""
+    ws_uuid = _parse_ws_uuid(workspace_id)
+    node = await db.scalar(
+        select(TaxonomyNode).where(TaxonomyNode.node_id == node_id, TaxonomyNode.workspace_id == ws_uuid)
+    )
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    node.description = description
+    await db.commit()
+    return {"message": "Description updated", "node_id": node_id}
 
 
 # ── TAXONOMY NODES ────────────────────────────────────────────────────────────

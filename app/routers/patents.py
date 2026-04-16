@@ -125,26 +125,36 @@ async def upload_patents(
 
     pn_col = _find_col(df, COLUMN_MAPPING["patent_number"])
 
+    # Bulk duplicate check — ONE query for all patent numbers in workspace
+    # Replaces N individual SELECT per row (was N DB round-trips for N rows)
+    all_incoming_pnums = []
+    for _, row in df.iterrows():
+        if pn_col and not pd.isna(row[pn_col]):
+            all_incoming_pnums.append(str(row[pn_col]).strip())
+    existing_pnums: set[str] = set()
+    if all_incoming_pnums:
+        existing_result = await db.scalars(
+            select(Patent.patent_number).where(
+                Patent.workspace_id == ws_uuid,
+                Patent.patent_number.in_(all_incoming_pnums),
+            )
+        )
+        existing_pnums = set(existing_result.all())
+
+    title_col = _find_col(df, COLUMN_MAPPING["title"])
+    abstract_col = _find_col(df, COLUMN_MAPPING["abstract"])
+
     for _, row in df.iterrows():
         if not pn_col or pd.isna(row[pn_col]):
             continue
         patent_number = str(row[pn_col]).strip()
 
-        # Duplicate check
-        existing = await db.scalar(
-            select(Patent).where(
-                Patent.workspace_id == ws_uuid,
-                Patent.patent_number == patent_number,
-            )
-        )
-        if existing:
+        # O(1) duplicate check via set — no DB call per row
+        if patent_number in existing_pnums:
             skipped_count += 1
             if len(duplicate_patents) < 10:
                 duplicate_patents.append(patent_number)
             continue
-
-        title_col = _find_col(df, COLUMN_MAPPING["title"])
-        abstract_col = _find_col(df, COLUMN_MAPPING["abstract"])
         title = str(row[title_col]) if title_col and not pd.isna(row.get(title_col)) else "No Title"
         abstract = str(row[abstract_col]) if abstract_col and not pd.isna(row.get(abstract_col)) else ""
 
@@ -189,7 +199,12 @@ async def upload_patents(
         created_count += 1
         uploaded_patents.append(patent_data)
 
-    await db.commit()
+        # Commit every 1000 rows — prevents one massive transaction for large uploads
+        if created_count % 1000 == 0:
+            await db.commit()
+            logger.info(f"Upload: committed {created_count} patents so far")
+
+    await db.commit()  # final commit for remaining rows
 
     # Watchlist batch check
     alerts_info = []

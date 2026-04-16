@@ -5,14 +5,16 @@ import json
 import re
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Form, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, update
+from sqlalchemy import select, delete, update, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.models import TaxonomyNode, PatentTaxonomy, Patent
 from app.deps import get_db, get_current_user, require_role
 from app.services.watchlist import check_taxonomy_watchlist_rules
 from app.services.llm import get_llm
+from app import auth as auth_module
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["taxonomy"])
@@ -88,6 +90,10 @@ COMMIT_BATCH_SIZE = 50  # commit to DB every N patents in bulk jobs
 _BULK_JOBS: dict[str, dict] = {}
 _ENHANCE_JOBS: dict[str, dict] = {}
 _ENHANCE_SEMAPHORE = asyncio.Semaphore(10)  # cap concurrent enhance LLM calls
+
+# SSE queues: job_id → asyncio.Queue — background task pushes events, SSE endpoint drains them
+# One queue per active SSE connection; None if no client is listening.
+_BULK_JOB_QUEUES: dict[str, asyncio.Queue] = {}
 
 
 def _passes_domain_screen(
@@ -175,17 +181,23 @@ async def _bulk_classify_task(
         "status": "running", "done": 0, "total": 0,
         "tagged": 0, "no_match": 0, "failed": 0,
     })
+
+    # Page size for loading patents — keeps memory flat regardless of corpus size
+    PATENT_PAGE_SIZE = 500
+
     try:
+        # ── Phase 1: snapshot IDs + load taxonomy (short-lived session) ────────────
         async with AsyncSessionLocal() as db:
-            # Load all pending patents
-            patent_result = await db.scalars(
-                select(Patent).where(
+            # Snapshot pending patent IDs (lightweight — IDs only, not full objects)
+            # Snapshot is taken once so page queries stay stable as status changes during processing
+            id_result = await db.scalars(
+                select(Patent.id).where(
                     Patent.workspace_id == workspace_id,
                     Patent.review_status == "pending",
-                )
+                ).order_by(Patent.id)
             )
-            patents = list(patent_result.all())
-            total = len(patents)
+            all_pending_ids = list(id_result.all())
+            total = len(all_pending_ids)
             _BULK_JOBS[job_id]["total"] = total
             if total == 0:
                 _BULK_JOBS[job_id]["status"] = "done"
@@ -237,136 +249,155 @@ async def _bulk_classify_task(
             )
             llm = get_llm()
             _RETRY_BACKOFF = [2, 5, 10]
+        # ── Phase 1 complete — taxonomy + ID snapshot loaded, session closed ──────
+        # Phase 2: page-by-page processing with fresh short-lived DB sessions per page.
+        # This prevents a single long-held DB connection from timing out on hour-long jobs.
 
-            async def classify_one(patent: Patent) -> tuple:
-                title = (patent.title or "").strip()
-                abstract = (patent.abstract or "")[:800].strip()
-                assignee = (patent.assignee or "").strip()
-                cpc = (patent.cpc_class or "").strip()
-                claims_raw = (patent.claims_text or patent.first_claim or "").strip() if include_claims else (patent.first_claim or "").strip()
-                claims_section = claims_raw[:10000]
+        async def classify_one(patent: Patent) -> tuple:
+            title = (patent.title or "").strip()
+            abstract = (patent.abstract or "")[:800].strip()
+            assignee = (patent.assignee or "").strip()
+            cpc = (patent.cpc_class or "").strip()
+            claims_raw = (patent.claims_text or patent.first_claim or "").strip() if include_claims else (patent.first_claim or "").strip()
+            claims_section = claims_raw[:10000]
 
-                # Tier 1: keyword pre-screen (no LLM cost)
-                if not _passes_domain_screen(title, abstract, patent.first_claim or "", roots):
-                    logger.info(f"Bulk pre-screen: {patent.patent_number} skipped")
-                    return patent, []
+            # Tier 1: keyword pre-screen (no LLM cost)
+            if not _passes_domain_screen(title, abstract, patent.first_claim or "", roots):
+                logger.debug(f"Bulk pre-screen: {patent.patent_number} skipped")
+                return patent, []
 
-                prompt = (
-                    f"PATENT TAXONOMY CLASSIFICATION\n\n"
-                    f"Quality standard: Correct tagging > Complete tagging. "
-                    f"Assign ZERO tags rather than one wrong tag. "
-                    f"Only tag what you can directly quote from a claim.\n\n"
-                    f"━━━ PATENT ━━━\n"
-                    f"Title: {title}\n"
-                    f"{f'Assignee: {assignee}' if assignee else ''}\n"
-                    f"{f'CPC: {cpc}' if cpc else ''}\n"
-                    f"Abstract: {abstract}\n\n"
-                    f"{f'Claims:{chr(10)}{claims_section}' if claims_section else ''}\n\n"
-                    f"━━━ STEP 1: DOMAIN SCREEN ━━━\n"
-                    f"Does this patent primarily claim a device, method, or system in these domains?\n"
-                    f"{roots_list}\n"
-                    f"→ If NONE apply → return [] immediately.\n"
-                    f"→ If YES → continue to Step 2.\n\n"
-                    f"━━━ STEP 2: PER-TAG EVALUATION ━━━\n"
-                    f"Evaluate EVERY node in the taxonomy below — both [ROOT TAG] and [TAG]:\n"
-                    f"  a. Read its Description to understand what evidence qualifies.\n"
-                    f"  b. If Description contains 'QUALIFYING PHRASES:', search the patent claims for those\n"
-                    f"     exact phrases first — a verbatim or near-verbatim match is strong evidence.\n"
-                    f"  c. IMPORTANT: Check EVERY claim — independent AND dependent.\n"
-                    f"     Dependent claims contain material types, mechanisms, and functional details\n"
-                    f"     that are where secondary tags often live.\n"
-                    f"  d. Decide YES (you can quote a claim sentence) or NO (not found or ambiguous).\n\n"
-                    f"TAXONOMY:\n"
-                    f"[ROOT TAG] = broad category tag — apply ONLY when the patent's primary subject matter clearly falls under this category. Requires direct claim evidence, not just topical relevance.\n"
-                    f"[TAG] = specific child tag — apply when you can quote exact claim language matching the description.\n"
-                    f"Both [ROOT TAG] and [TAG] IDs may appear in your output.\n"
-                    f"{taxonomy_tree}\n\n"
-                    f"━━━ STEP 3: PRECISION FILTER ━━━\n"
-                    f"Remove a YES tag if ANY of these apply:\n"
-                    f"  ✗ Evidence is in background or prior art section — not in a claim\n"
-                    f"  ✗ Material tag: named material applies to wrong component\n"
-                    f"  ✗ Mechanism tag: behavior is implied, not an explicitly named mechanism element\n"
-                    f"  ✗ Delivery tag: primary independent claim is the implant, not the delivery system\n"
-                    f"  ✗ Still uncertain after checking all claims → default NO\n\n"
-                    f"━━━ OUTPUT FORMAT ━━━\n"
-                    f"Return ONLY a JSON array — no text before or after:\n"
-                    f'[\"node_id_1\", \"node_id_2\"]\n'
-                    f"Empty array [] if no tags pass. No keys, no evidence, no explanation."
-                )
-
-                last_exc = None
-                async with _CLASSIFY_SEMAPHORE:
-                    for attempt in range(3):
-                        try:
-                            response = await llm.chat.completions.create(
-                                model="deepseek/deepseek-v3.2",
-                                messages=[
-                                    {"role": "system", "content": system_content},
-                                    {"role": "user", "content": prompt},
-                                ],
-                                max_tokens=300,
-                                temperature=0.0,
-                                timeout=45,  # 45s hard cap — compact output, no reason to wait longer
-                            )
-                            last_exc = None
-                            break
-                        except Exception as e:
-                            last_exc = e
-                            logger.warning(f"Bulk LLM attempt {attempt+1}/3 for {patent.patent_number}: {e}")
-                            if attempt < 2:
-                                await asyncio.sleep(_RETRY_BACKOFF[attempt])
-
-                if last_exc is not None:
-                    logger.error(f"Bulk classify: {patent.patent_number} failed after 3 attempts: {last_exc}")
-                    return patent, None
-
-                choice = response.choices[0]
-                finish_reason = getattr(choice, "finish_reason", "stop") or "stop"
-                content = (choice.message.content or "").strip()
-                raw_ids = _safe_parse_id_array(content, finish_reason, patent_number=patent.patent_number)
-                tag_ids = [nid for nid in raw_ids if nid in id_to_node]
-                return patent, tag_ids
-
-            # Tier-1 pre-screen stats (logged before launch so we know filter rate)
-            screened_count = sum(
-                1 for p in patents
-                if not _passes_domain_screen(
-                    (p.title or ""), (p.abstract or "")[:800], (p.first_claim or ""), roots
-                )
-            )
-            logger.info(
-                f"Bulk classify job {job_id}: {total} patents — "
-                f"{total - screened_count} pass Tier-1 screen (get LLM call), "
-                f"{screened_count} filtered as out-of-domain"
+            prompt = (
+                f"PATENT TAXONOMY CLASSIFICATION\n\n"
+                f"Quality standard: Correct tagging > Complete tagging. "
+                f"Assign ZERO tags rather than one wrong tag. "
+                f"Only tag what you can directly quote from a claim.\n\n"
+                f"━━━ PATENT ━━━\n"
+                f"Title: {title}\n"
+                f"{f'Assignee: {assignee}' if assignee else ''}\n"
+                f"{f'CPC: {cpc}' if cpc else ''}\n"
+                f"Abstract: {abstract}\n\n"
+                f"{f'Claims:{chr(10)}{claims_section}' if claims_section else ''}\n\n"
+                f"━━━ STEP 1: DOMAIN SCREEN ━━━\n"
+                f"Does this patent primarily claim a device, method, or system in these domains?\n"
+                f"{roots_list}\n"
+                f"→ If NONE apply → return [] immediately.\n"
+                f"→ If YES → continue to Step 2.\n\n"
+                f"━━━ STEP 2: PER-TAG EVALUATION ━━━\n"
+                f"Evaluate EVERY node in the taxonomy below — both [ROOT TAG] and [TAG]:\n"
+                f"  a. Read its Description to understand what evidence qualifies.\n"
+                f"  b. If Description contains 'QUALIFYING PHRASES:', search the patent claims for those\n"
+                f"     exact phrases first — a verbatim or near-verbatim match is strong evidence.\n"
+                f"  c. IMPORTANT: Check EVERY claim — independent AND dependent.\n"
+                f"     Dependent claims contain material types, mechanisms, and functional details\n"
+                f"     that are where secondary tags often live.\n"
+                f"  d. Decide YES (you can quote a claim sentence) or NO (not found or ambiguous).\n\n"
+                f"TAXONOMY:\n"
+                f"[ROOT TAG] = broad category tag — apply ONLY when the patent's primary subject matter clearly falls under this category. Requires direct claim evidence, not just topical relevance.\n"
+                f"[TAG] = specific child tag — apply when you can quote exact claim language matching the description.\n"
+                f"Both [ROOT TAG] and [TAG] IDs may appear in your output.\n"
+                f"{taxonomy_tree}\n\n"
+                f"━━━ STEP 3: PRECISION FILTER ━━━\n"
+                f"Remove a YES tag if ANY of these apply:\n"
+                f"  ✗ Evidence is in background or prior art section — not in a claim\n"
+                f"  ✗ Material tag: named material applies to wrong component\n"
+                f"  ✗ Mechanism tag: behavior is implied, not an explicitly named mechanism element\n"
+                f"  ✗ Delivery tag: primary independent claim is the implant, not the delivery system\n"
+                f"  ✗ Still uncertain after checking all claims → default NO\n\n"
+                f"━━━ OUTPUT FORMAT ━━━\n"
+                f"Return ONLY a JSON array — no text before or after:\n"
+                f'[\"node_id_1\", \"node_id_2\"]\n'
+                f"Empty array [] if no tags pass. No keys, no evidence, no explanation."
             )
 
-            # Launch all patent tasks — semaphore caps concurrency at MAX_CONCURRENT_LLM
-            tasks = [asyncio.ensure_future(classify_one(p)) for p in patents]
-            commit_buffer: list[tuple] = []
+            last_exc = None
+            async with _CLASSIFY_SEMAPHORE:
+                for attempt in range(3):
+                    try:
+                        response = await llm.chat.completions.create(
+                            model="deepseek/deepseek-v3.2",
+                            messages=[
+                                {"role": "system", "content": system_content},
+                                {"role": "user", "content": prompt},
+                            ],
+                            max_tokens=300,
+                            temperature=0.0,
+                            timeout=45,
+                        )
+                        last_exc = None
+                        break
+                    except Exception as e:
+                        last_exc = e
+                        logger.warning(f"Bulk LLM attempt {attempt+1}/3 for {patent.patent_number}: {e}")
+                        if attempt < 2:
+                            await asyncio.sleep(_RETRY_BACKOFF[attempt])
 
-            for coro in asyncio.as_completed(tasks):
-                patent, tag_ids = await coro
-                commit_buffer.append((patent, tag_ids))
+            if last_exc is not None:
+                logger.error(f"Bulk classify: {patent.patent_number} failed after 3 attempts: {last_exc}")
+                return patent, None
 
-                if tag_ids is None:
-                    _BULK_JOBS[job_id]["failed"] += 1
-                elif tag_ids:
-                    _BULK_JOBS[job_id]["tagged"] += 1
-                else:
-                    _BULK_JOBS[job_id]["no_match"] += 1
-                _BULK_JOBS[job_id]["done"] += 1
+            choice = response.choices[0]
+            finish_reason = getattr(choice, "finish_reason", "stop") or "stop"
+            content = (choice.message.content or "").strip()
+            raw_ids = _safe_parse_id_array(content, finish_reason, patent_number=patent.patent_number)
+            tag_ids = [nid for nid in raw_ids if nid in id_to_node]
+            return patent, tag_ids
 
-                if len(commit_buffer) >= COMMIT_BATCH_SIZE:
+        # Phase 2: page-by-page processing — fresh short-lived DB session per page.
+        # 500 patents per page → 20 concurrent LLM calls via semaphore.
+        # Memory stays flat: never more than 500 Patent objects in RAM at once.
+        for page_start in range(0, total, PATENT_PAGE_SIZE):
+            page_ids = all_pending_ids[page_start : page_start + PATENT_PAGE_SIZE]
+
+            async with AsyncSessionLocal() as db:
+                page_result = await db.scalars(
+                    select(Patent).where(Patent.id.in_(page_ids))
+                )
+                page_patents = list(page_result.all())
+
+                logger.info(
+                    f"Job {job_id}: page {page_start // PATENT_PAGE_SIZE + 1}"
+                    f" ({len(page_patents)} patents, {page_start}/{total} done)"
+                )
+
+                tasks = [asyncio.ensure_future(classify_one(p)) for p in page_patents]
+                commit_buffer: list[tuple] = []
+
+                for coro in asyncio.as_completed(tasks):
+                    patent, tag_ids = await coro
+                    commit_buffer.append((patent, tag_ids))
+
+                    if tag_ids is None:
+                        _BULK_JOBS[job_id]["failed"] += 1
+                    elif tag_ids:
+                        _BULK_JOBS[job_id]["tagged"] += 1
+                    else:
+                        _BULK_JOBS[job_id]["no_match"] += 1
+                    _BULK_JOBS[job_id]["done"] += 1
+
+                    # Push real-time progress to SSE client (if connected)
+                    sse_q = _BULK_JOB_QUEUES.get(job_id)
+                    if sse_q:
+                        sse_q.put_nowait({
+                            "done": _BULK_JOBS[job_id]["done"],
+                            "total": total,
+                            "tagged": _BULK_JOBS[job_id]["tagged"],
+                            "no_match": _BULK_JOBS[job_id]["no_match"],
+                            "failed": _BULK_JOBS[job_id]["failed"],
+                            "status": "running",
+                        })
+
+                    if len(commit_buffer) >= COMMIT_BATCH_SIZE:
+                        await _flush_bulk_chunk(db, commit_buffer, node_label_map, user_email)
+                        commit_buffer.clear()
+                        logger.info(
+                            f"Job {job_id}: committed chunk — "
+                            f"{_BULK_JOBS[job_id]['done']}/{total} done, "
+                            f"{_BULK_JOBS[job_id]['tagged']} tagged"
+                        )
+
+                if commit_buffer:
                     await _flush_bulk_chunk(db, commit_buffer, node_label_map, user_email)
-                    commit_buffer.clear()
-                    logger.info(
-                        f"Job {job_id}: committed chunk — "
-                        f"{_BULK_JOBS[job_id]['done']}/{total} done, "
-                        f"{_BULK_JOBS[job_id]['tagged']} tagged"
-                    )
-
-            if commit_buffer:
-                await _flush_bulk_chunk(db, commit_buffer, node_label_map, user_email)
+            # Page session closed — connection returned to pool before next page starts
 
         _BULK_JOBS[job_id]["status"] = "done"
         logger.info(
@@ -375,9 +406,15 @@ async def _bulk_classify_task(
             f"{_BULK_JOBS[job_id]['no_match']} no-match, "
             f"{_BULK_JOBS[job_id]['failed']} failed"
         )
+        sse_q = _BULK_JOB_QUEUES.pop(job_id, None)
+        if sse_q:
+            sse_q.put_nowait({**_BULK_JOBS[job_id], "total": _BULK_JOBS[job_id]["total"]})
     except Exception as exc:
         logger.error(f"Bulk classify job {job_id} crashed: {exc}", exc_info=True)
         _BULK_JOBS[job_id].update({"status": "error", "error": str(exc)})
+        sse_q = _BULK_JOB_QUEUES.pop(job_id, None)
+        if sse_q:
+            sse_q.put_nowait({"status": "error", "error": str(exc)})
 
 
 @router.post("/taxonomy/classify-workspace")
@@ -402,11 +439,66 @@ async def get_bulk_classify_status(
     job_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """Poll the status of a bulk classification job."""
+    """Poll the status of a bulk classification job (fallback for non-SSE clients)."""
     job = _BULK_JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@router.get("/taxonomy/classify-workspace/{job_id}/stream")
+async def stream_classify_progress(
+    job_id: str,
+    token: str = Query(...),  # EventSource cannot set Authorization header — use query param
+):
+    """SSE endpoint: streams real-time classification progress as each patent completes.
+
+    Connect once after starting a job. Each 'data:' event is a JSON progress snapshot.
+    A heartbeat comment (':\\n\\n') is sent every 25 seconds to keep the connection alive.
+    The stream closes automatically when status becomes 'done' or 'error'.
+    """
+    # Validate token manually (cannot use Depends with EventSource)
+    try:
+        auth_module.decode_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    job = _BULK_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Register an asyncio.Queue for this connection.
+    # The background task will push events via put_nowait().
+    q: asyncio.Queue = asyncio.Queue(maxsize=0)  # unbounded
+    _BULK_JOB_QUEUES[job_id] = q
+
+    async def generate():
+        # Send current snapshot immediately so client is never blind on connect
+        current = dict(_BULK_JOBS.get(job_id, {}))
+        yield f"data: {json.dumps(current)}\n\n"
+
+        if current.get("status") in ("done", "error"):
+            _BULK_JOB_QUEUES.pop(job_id, None)
+            return
+
+        while True:
+            try:
+                data = await asyncio.wait_for(q.get(), timeout=25)
+                yield f"data: {json.dumps(data)}\n\n"
+                if data.get("status") in ("done", "error"):
+                    break
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"  # keeps ngrok/nginx from closing idle connection
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",    # disable nginx response buffering
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ── TAXONOMY NODES ────────────────────────────────────────────────────────────

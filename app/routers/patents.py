@@ -380,7 +380,8 @@ async def keyword_search(
 async def list_investigation_queue(
     workspace_id: Optional[str] = None,
     status: str = "pending",
-    limit: int = 2000,
+    limit: int = 50,
+    skip: int = 0,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -395,7 +396,7 @@ async def list_investigation_queue(
         stmt = stmt.where(Patent.review_status == "reviewed")
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
-    result = await db.scalars(stmt.order_by(Patent.created_at.desc()).limit(limit))
+    result = await db.scalars(stmt.order_by(Patent.created_at.desc()).offset(skip).limit(limit))
     patents = list(result.all())
 
     # Batch-load taxonomy labels in ONE query (eliminates N per-patent API calls)
@@ -423,7 +424,6 @@ async def list_investigation_queue(
                 "filing_date": p.filing_date.isoformat() if p.filing_date else None,
                 "legal_status": p.legal_status,
                 "patent_url": p.patent_url,
-                "claims_text": p.claims_text,
                 "first_claim": p.first_claim,
                 "cpc_class": p.cpc_class,
                 "review_status": p.review_status or "pending",

@@ -523,9 +523,12 @@ async def stream_classify_progress(
         generate(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
             "X-Accel-Buffering": "no",    # disable nginx response buffering
+            "Ngrok-Skip-Browser-Warning": "1",
             "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
         },
     )
 

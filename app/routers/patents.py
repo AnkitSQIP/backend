@@ -396,7 +396,9 @@ async def list_investigation_queue(
         stmt = stmt.where(Patent.review_status == "reviewed")
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
-    result = await db.scalars(stmt.order_by(Patent.created_at.desc()).offset(skip).limit(limit))
+    # Sort by updated_at desc so recently-reviewed/reopened patents float to top
+    order_col = Patent.updated_at if hasattr(Patent, "updated_at") else Patent.created_at
+    result = await db.scalars(stmt.order_by(order_col.desc()).offset(skip).limit(limit))
     patents = list(result.all())
 
     # Batch-load taxonomy labels in ONE query (eliminates N per-patent API calls)

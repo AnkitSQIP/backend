@@ -8,3 +8,7 @@ build/
 .venv/
 venv/
 PROMPTS.md
+.claude/
+.claude-mem/
+.code-review-graph/
+.symdex/

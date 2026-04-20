@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func, or_, and_
 import pandas as pd
@@ -11,6 +12,11 @@ import pandas as pd
 from app.models import Patent, PatentTaxonomy, InvestigationQueueItem
 from app.deps import get_db, get_current_user
 from app.services.watchlist import check_watchlist_rules_batch
+
+
+class BulkReopenBody(BaseModel):
+    workspace_id: str
+    patent_ids: list[str]
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["patents"])
@@ -382,6 +388,7 @@ async def list_investigation_queue(
     status: str = "pending",
     limit: int = 50,
     skip: int = 0,
+    slim: bool = False,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -414,29 +421,33 @@ async def list_investigation_queue(
             tax_map[t.patent_number].append(t.taxonomy_label or "")
             tax_id_map[t.patent_number].append(t.taxonomy_node_id or "")
 
-    return {
-        "queue": [
-            {
-                "id": str(p.id),
-                "patent_number": p.patent_number,
-                "title": p.title,
+    def _item(p: Patent) -> dict:
+        base = {
+            "id": str(p.id),
+            "patent_number": p.patent_number,
+            "title": p.title,
+            "assignee": p.assignee,
+            "patent_url": p.patent_url,
+            "review_status": p.review_status or "pending",
+            "review_note": p.review_note,
+            "reviewed_at": p.reviewed_at.isoformat() if p.reviewed_at else None,
+            "workspace_id": str(p.workspace_id),
+            "taxonomy_labels": tax_map[p.patent_number],
+            "taxonomy_node_ids": tax_id_map[p.patent_number],
+        }
+        if not slim:
+            base.update({
                 "abstract": p.abstract,
-                "assignee": p.assignee,
                 "publication_date": p.publication_date.isoformat() if p.publication_date else None,
                 "filing_date": p.filing_date.isoformat() if p.filing_date else None,
                 "legal_status": p.legal_status,
-                "patent_url": p.patent_url,
                 "first_claim": p.first_claim,
                 "cpc_class": p.cpc_class,
-                "review_status": p.review_status or "pending",
-                "review_note": p.review_note,
-                "reviewed_at": p.reviewed_at.isoformat() if p.reviewed_at else None,
-                "workspace_id": str(p.workspace_id),
-                "taxonomy_labels": tax_map[p.patent_number],
-                "taxonomy_node_ids": tax_id_map[p.patent_number],
-            }
-            for p in patents
-        ],
+            })
+        return base
+
+    return {
+        "queue": [_item(p) for p in patents],
         "total": total or 0,
     }
 
@@ -481,6 +492,40 @@ async def reopen_patent_review(
     patent.reviewed_at = None
     await db.commit()
     return {"message": "Patent reopened for review"}
+
+
+@router.post("/investigation-queue/bulk-reopen")
+async def bulk_reopen_patents(
+    body: BulkReopenBody,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    ws_uuid = _parse_ws_uuid(body.workspace_id)
+    if not body.patent_ids:
+        # Reopen all reviewed in workspace
+        await db.execute(
+            update(Patent)
+            .where(Patent.workspace_id == ws_uuid, Patent.review_status == "reviewed")
+            .values(review_status="pending", reviewed_by=None, reviewed_at=None, updated_at=datetime.now(timezone.utc))
+        )
+    else:
+        pids = []
+        for pid in body.patent_ids:
+            try:
+                pids.append(uuid.UUID(pid))
+            except (ValueError, AttributeError):
+                pass
+        if pids:
+            CHUNK = 500
+            for i in range(0, len(pids), CHUNK):
+                chunk = pids[i:i + CHUNK]
+                await db.execute(
+                    update(Patent)
+                    .where(Patent.id.in_(chunk))
+                    .values(review_status="pending", reviewed_by=None, reviewed_at=None, updated_at=datetime.now(timezone.utc))
+                )
+    await db.commit()
+    return {"message": "Patents reopened", "count": len(body.patent_ids)}
 
 
 @router.post("/investigation-queue")

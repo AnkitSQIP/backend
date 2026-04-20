@@ -2,6 +2,7 @@
 IPWatch FastAPI application.
 Replaces the monolithic server.py with a clean router-based architecture.
 """
+import asyncio
 import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,12 +48,31 @@ async def api_health():
     return {"status": "healthy"}
 
 
+_keepalive_lock = asyncio.Lock()
+
+async def _keepalive_loop():
+    """Ping DB every 10s to prevent Neon cold starts. Skips if a ping is already running."""
+    from app.database import AsyncSessionLocal
+    from sqlalchemy import text
+    while True:
+        await asyncio.sleep(10)
+        if _keepalive_lock.locked():
+            continue
+        async with _keepalive_lock:
+            try:
+                async with AsyncSessionLocal() as db:
+                    await asyncio.wait_for(db.execute(text("SELECT 1")), timeout=5)
+            except Exception:
+                pass
+
+
 @app.on_event("startup")
 async def startup():
     # Create tables (safe: does nothing if they already exist)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await _seed_default_users()
+    asyncio.create_task(_keepalive_loop())
     logger.info("IPWatch backend started")
 
 

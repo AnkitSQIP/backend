@@ -16,7 +16,7 @@ _db_url = _db_url.rstrip('?&')
 
 # Neon: SSL required. PgBouncer (local): no SSL, but disable prepared statements
 # (asyncpg prepared statements don't work with PgBouncer transaction mode)
-_connect_args: dict = {"ssl": "require"} if _needs_ssl else {"statement_cache_size": 0}
+_connect_args: dict = {"ssl": "require"} if _needs_ssl else {"ssl": False, "statement_cache_size": 0}
 
 engine = create_async_engine(
     _db_url,

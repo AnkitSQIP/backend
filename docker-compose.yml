@@ -7,7 +7,7 @@ networks:
 services:
 
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg17
     container_name: ipwatch-postgres
     restart: unless-stopped
     environment:

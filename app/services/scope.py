@@ -4,7 +4,7 @@ import logging
 import uuid
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, distinct, text
+from sqlalchemy import select, func, distinct, text, or_
 from sqlalchemy.dialects.postgresql import array
 
 from app.models import WorkspaceScope, TaxonomyNode, PatentTaxonomy, Patent
@@ -125,26 +125,6 @@ def _extract_qualifying_phrases(description: str) -> list[str]:
     return phrases[:12]  # cap at 12 to keep tsquery manageable
 
 
-def _build_tsquery(terms: list[str]) -> Optional[str]:
-    """Convert list of phrase strings into a PostgreSQL tsquery."""
-    if not terms:
-        return None
-    parts = []
-    for term in terms:
-        # Each multi-word phrase becomes phrase query with <-> operator
-        words = [w for w in re.sub(r"[^\w\s]", " ", term).split() if len(w) > 1]
-        if not words:
-            continue
-        if len(words) == 1:
-            parts.append(f"{words[0]}:*")
-        else:
-            parts.append(" <-> ".join(words))
-    if not parts:
-        return None
-    # OR across all phrase parts
-    return " | ".join(f"({p})" for p in parts[:50])  # cap at 50 parts
-
-
 async def get_scoped_patent_ids(
     workspace_id: str,
     scope: WorkspaceScope,
@@ -160,39 +140,61 @@ async def get_scoped_patent_ids(
     ws_uuid = uuid.UUID(workspace_id)
     matched_ids: set[str] = set()
 
-    # Collect all search terms: user strings + LLM expanded + taxonomy qualifying phrases
-    all_bm25_terms = list(scope.search_strings) + list(scope.expanded_terms)
+    # Collect all BM25 search terms: user strings + LLM expanded + taxonomy qualifying phrases
+    # Each term is searched independently via websearch_to_tsquery — OR across all terms.
+    # websearch_to_tsquery handles natural language, commas (OR), +signs (AND), semicolons, etc.
+    all_bm25_terms: list[str] = list(scope.search_strings) + list(scope.expanded_terms)
 
-    # Add qualifying phrases from selected taxonomy nodes
+    # Add taxonomy node labels and qualifying phrases from selected nodes (and their parents)
+    semantic_extra_texts: list[str] = []
     if scope.taxonomy_node_ids:
         node_rows = await db.execute(
-            select(TaxonomyNode.description).where(
+            select(TaxonomyNode.label, TaxonomyNode.description).where(
                 TaxonomyNode.node_id.in_(scope.taxonomy_node_ids)
             )
         )
-        for (desc,) in node_rows:
-            all_bm25_terms.extend(_extract_qualifying_phrases(desc or ""))
+        for (label, desc) in node_rows:
+            if label:
+                all_bm25_terms.append(label)
+                semantic_extra_texts.append(label)
+            phrases = _extract_qualifying_phrases(desc or "")
+            all_bm25_terms.extend(phrases)
+            if phrases:
+                semantic_extra_texts.extend(phrases[:3])
 
-    # 1. BM25 full-text search
-    tsq = _build_tsquery(all_bm25_terms)
-    if tsq:
+    # Deduplicate and drop empty terms
+    all_bm25_terms = [t for t in dict.fromkeys(all_bm25_terms) if t and t.strip()]
+
+    # 1. BM25 full-text search — one websearch_to_tsquery call per term, OR'd together
+    # websearch_to_tsquery is safe with any input (unlike to_tsquery which requires valid syntax)
+    if all_bm25_terms:
         try:
+            # Build: search_vector @@ websearch_to_tsquery('english', :q0) OR ...
+            # Cap at 60 terms to keep query size reasonable
+            terms_capped = all_bm25_terms[:60]
+            placeholders = " OR ".join(
+                f"search_vector @@ websearch_to_tsquery('english', :q{i})"
+                for i in range(len(terms_capped))
+            )
+            params = {f"q{i}": t for i, t in enumerate(terms_capped)}
             bm25_result = await db.execute(
                 select(Patent.id).where(
                     Patent.workspace_id == ws_uuid,
-                    text("search_vector @@ to_tsquery('english', :q)").bindparams(q=tsq),
+                    text(f"({placeholders})").bindparams(**params),
                 )
             )
             for (pid,) in bm25_result:
                 matched_ids.add(str(pid))
-            logger.info(f"BM25 matched {len(matched_ids)} patents")
+            logger.info(f"BM25 matched {len(matched_ids)} patents from {len(terms_capped)} terms")
         except Exception as e:
             logger.warning(f"BM25 search failed: {e}")
 
     # 2. Semantic search via pgvector (only if embed service available + embeddings exist)
+    # Searches user strings + taxonomy term texts — OR logic (union with BM25 results)
     embed_client = get_embed_client()
-    if embed_client and scope.search_strings:
-        query_text = " ".join(scope.search_strings)
+    semantic_query_parts = list(scope.search_strings) + semantic_extra_texts
+    if embed_client and semantic_query_parts:
+        query_text = " ".join(dict.fromkeys(semantic_query_parts))
         query_vec = await embed_client.embed(query_text)
         if query_vec:
             try:

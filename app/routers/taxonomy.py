@@ -180,8 +180,10 @@ async def _bulk_classify_task(
     workspace_id: uuid.UUID,
     include_claims: bool,
     user_email: str,
+    scope_mode: bool = False,
 ) -> None:
-    """Server-side background task: classify ALL pending patents in workspace."""
+    """Server-side background task: classify pending patents in workspace.
+    When scope_mode=True, only classifies patents matching the saved workspace scope."""
     from app.database import AsyncSessionLocal
 
     _BULK_JOBS[job_id].update({
@@ -204,6 +206,16 @@ async def _bulk_classify_task(
                 ).order_by(Patent.id)
             )
             all_pending_ids = list(id_result.all())
+
+            # When scope_mode, restrict classification to scoped patent IDs only
+            if scope_mode:
+                from app.services.scope import get_scope, get_scoped_patent_ids
+                scope = await get_scope(str(workspace_id), db)
+                scoped_ids = await get_scoped_patent_ids(str(workspace_id), scope, db)
+                if scoped_ids is not None:
+                    all_pending_ids = [pid for pid in all_pending_ids if str(pid) in scoped_ids]
+                    logger.info(f"Scope filter: {len(all_pending_ids)} of pending patents in scope")
+
             total = len(all_pending_ids)
             _BULK_JOBS[job_id]["total"] = total
             if total == 0:
@@ -468,16 +480,18 @@ async def _bulk_classify_task(
 async def start_bulk_classify(
     workspace_id: str = Query(...),
     include_claims: bool = Query(True),
+    scope_mode: bool = Query(False),
     current_user: dict = Depends(require_role(["ADMIN", "admin", "ANALYST", "analyst"])),
     db: AsyncSession = Depends(get_db),
 ):
-    """Start a server-side background classification job for all pending patents."""
+    """Start a server-side background classification job for all pending patents.
+    When scope_mode=true, only classifies patents matching the saved workspace scope."""
     ws_uuid = _parse_ws_uuid(workspace_id)
     job_id = str(uuid.uuid4())
     user_email = current_user.get("email", "system")
     _BULK_JOBS[job_id] = {"status": "queued", "done": 0, "total": 0, "tagged": 0, "no_match": 0, "failed": 0}
-    asyncio.create_task(_bulk_classify_task(job_id, ws_uuid, include_claims, user_email))
-    logger.info(f"Bulk classify job {job_id} started for workspace {workspace_id} by {user_email}")
+    asyncio.create_task(_bulk_classify_task(job_id, ws_uuid, include_claims, user_email, scope_mode=scope_mode))
+    logger.info(f"Bulk classify job {job_id} started for workspace {workspace_id} by {user_email} scope_mode={scope_mode}")
     return {"job_id": job_id, "status": "queued"}
 
 

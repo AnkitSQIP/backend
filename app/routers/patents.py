@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, func, or_, and_
+from sqlalchemy import select, update, delete as sql_delete, func, or_, and_
 import pandas as pd
 
 from app.models import Patent, PatentTaxonomy, InvestigationQueueItem
@@ -509,6 +509,8 @@ async def reopen_patent_review(
     patent = await db.scalar(select(Patent).where(Patent.id == pid))
     if not patent:
         raise HTTPException(status_code=404, detail="Patent not found")
+    # Clear all taxonomy tags so re-classification starts clean
+    await db.execute(sql_delete(PatentTaxonomy).where(PatentTaxonomy.patent_number == patent.patent_number))
     patent.review_status = "pending"
     patent.reviewed_by = None
     patent.reviewed_at = None
@@ -523,12 +525,22 @@ async def bulk_reopen_patents(
     db: AsyncSession = Depends(get_db),
 ):
     ws_uuid = _parse_ws_uuid(body.workspace_id)
+    now = datetime.now(timezone.utc)
     if not body.patent_ids:
-        # Reopen all reviewed in workspace
+        # Reopen all reviewed in workspace — clear their tags first
+        pnums_result = await db.scalars(
+            select(Patent.patent_number).where(
+                Patent.workspace_id == ws_uuid, Patent.review_status == "reviewed"
+            )
+        )
+        pnums = list(pnums_result.all())
+        CHUNK = 500
+        for i in range(0, len(pnums), CHUNK):
+            await db.execute(sql_delete(PatentTaxonomy).where(PatentTaxonomy.patent_number.in_(pnums[i:i + CHUNK])))
         await db.execute(
             update(Patent)
             .where(Patent.workspace_id == ws_uuid, Patent.review_status == "reviewed")
-            .values(review_status="pending", reviewed_by=None, reviewed_at=None, updated_at=datetime.now(timezone.utc))
+            .values(review_status="pending", reviewed_by=None, reviewed_at=None, updated_at=now)
         )
     else:
         pids = []
@@ -538,13 +550,18 @@ async def bulk_reopen_patents(
             except (ValueError, AttributeError):
                 pass
         if pids:
+            # Get patent_numbers for these IDs, clear their tags, then reopen
             CHUNK = 500
             for i in range(0, len(pids), CHUNK):
                 chunk = pids[i:i + CHUNK]
+                pnums_result = await db.scalars(select(Patent.patent_number).where(Patent.id.in_(chunk)))
+                pnums = list(pnums_result.all())
+                if pnums:
+                    await db.execute(sql_delete(PatentTaxonomy).where(PatentTaxonomy.patent_number.in_(pnums)))
                 await db.execute(
                     update(Patent)
                     .where(Patent.id.in_(chunk))
-                    .values(review_status="pending", reviewed_by=None, reviewed_at=None, updated_at=datetime.now(timezone.utc))
+                    .values(review_status="pending", reviewed_by=None, reviewed_at=None, updated_at=now)
                 )
     await db.commit()
     return {"message": "Patents reopened", "count": len(body.patent_ids)}

@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     hf_home: str = ""
     cors_origins: str = "*"
+    embed_service_url: str = ""  # http://ipwatch-embed:8002 when embed container running
 
     class Config:
         env_file = ".env"

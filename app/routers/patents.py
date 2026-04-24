@@ -12,6 +12,7 @@ import pandas as pd
 from app.models import Patent, PatentTaxonomy, InvestigationQueueItem
 from app.deps import get_db, get_current_user
 from app.services.watchlist import check_watchlist_rules_batch
+from app.database import AsyncSessionLocal
 
 
 class BulkReopenBody(BaseModel):
@@ -212,6 +213,11 @@ async def upload_patents(
 
     await db.commit()  # final commit for remaining rows
 
+    # Background embedding generation (non-blocking — doesn't delay upload response)
+    if uploaded_patents:
+        import asyncio as _asyncio
+        _asyncio.create_task(_generate_embeddings_bg(str(ws_uuid), db))
+
     # Watchlist batch check
     alerts_info = []
     if uploaded_patents:
@@ -389,10 +395,12 @@ async def list_investigation_queue(
     limit: int = 50,
     skip: int = 0,
     slim: bool = False,
+    scope_mode: bool = False,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     stmt = select(Patent)
+    ws_uuid = None
     if workspace_id:
         ws_uuid = _parse_ws_uuid(workspace_id)
         stmt = stmt.where(Patent.workspace_id == ws_uuid)
@@ -401,6 +409,20 @@ async def list_investigation_queue(
         stmt = stmt.where(or_(Patent.review_status == "pending", Patent.review_status.is_(None)))
     elif status == "reviewed":
         stmt = stmt.where(Patent.review_status == "reviewed")
+
+    # Apply scope filter when requested (pending tab only)
+    if scope_mode and workspace_id and status == "pending":
+        from app.services.scope import get_scope, get_scoped_patent_ids
+        scope = await get_scope(workspace_id, db)
+        scoped_ids = await get_scoped_patent_ids(workspace_id, scope, db)
+        if scoped_ids is not None:
+            import uuid as _uuid
+            uuid_ids = [_uuid.UUID(i) for i in scoped_ids]
+            if uuid_ids:
+                stmt = stmt.where(Patent.id.in_(uuid_ids))
+            else:
+                # No matches — return empty result
+                return {"queue": [], "total": 0}
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
     # Sort by updated_at desc so recently-reviewed/reopened patents float to top
@@ -596,3 +618,40 @@ async def reopen_queue_item(
     item.reviewed_at = None
     await db.commit()
     return {"message": "Item reopened"}
+
+
+async def _generate_embeddings_bg(workspace_id: str, _unused_db) -> None:
+    """Background task: generate embeddings for patents missing them in this workspace."""
+    from app.services.embed import get_embed_client
+    embed_client = get_embed_client()
+    if not embed_client:
+        return
+    try:
+        import uuid as _uuid
+        ws_uuid = _uuid.UUID(workspace_id)
+        async with AsyncSessionLocal() as db:
+            # Process in batches of 50 to avoid memory pressure
+            BATCH = 50
+            offset = 0
+            while True:
+                patents = list((await db.scalars(
+                    select(Patent)
+                    .where(Patent.workspace_id == ws_uuid, Patent.embedding.is_(None))
+                    .limit(BATCH)
+                    .offset(offset)
+                )).all())
+                if not patents:
+                    break
+                texts = [
+                    f"{p.title or ''} {p.abstract or ''} {p.first_claim or ''}"[:2000]
+                    for p in patents
+                ]
+                vectors = await embed_client.embed_batch(texts)
+                for patent, vec in zip(patents, vectors):
+                    if vec:
+                        patent.embedding = vec
+                await db.commit()
+                offset += BATCH
+        logger.info(f"Background embed: completed for workspace {workspace_id}")
+    except Exception as e:
+        logger.warning(f"Background embed failed: {e}")

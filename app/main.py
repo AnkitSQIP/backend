@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import engine
 from app.models import Base
-from app.routers import users, workspaces, patents, analytics, taxonomy, watchlists
+from app.routers import users, workspaces, patents, analytics, taxonomy, watchlists, scope
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ app.include_router(patents.router)
 app.include_router(analytics.router)
 app.include_router(taxonomy.router)
 app.include_router(watchlists.router)
+app.include_router(scope.router)
 
 
 @app.get("/health")
@@ -73,6 +74,8 @@ async def startup():
         await conn.run_sync(Base.metadata.create_all)
     await _seed_default_users()
     asyncio.create_task(_keepalive_loop())
+    from app.services.embed import init_embed_client
+    init_embed_client()
     logger.info("IPWatch backend started")
 
 

@@ -1,0 +1,89 @@
+version: "3.9"
+
+networks:
+  ipwatch-net:
+    name: ipwatch-net
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ipwatch-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ipwatch
+      POSTGRES_USER: ipwatch
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - /opt/ipwatch-db/pgdata:/var/lib/postgresql/data
+      - ./postgres.conf:/etc/postgresql/postgresql.conf:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    networks: [ipwatch-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ipwatch -d ipwatch"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  pgbouncer:
+    image: edoburu/pgbouncer:1.23.1
+    container_name: ipwatch-pgbouncer
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://ipwatch:${POSTGRES_PASSWORD}@postgres:5432/ipwatch
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 200
+      DEFAULT_POOL_SIZE: 20
+      SERVER_IDLE_TIMEOUT: 600
+      CLIENT_IDLE_TIMEOUT: 300
+    ports:
+      - "127.0.0.1:5433:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [ipwatch-net]
+
+  embed:
+    build:
+      context: ./embed-service
+      dockerfile: Dockerfile
+    container_name: ipwatch-embed
+    restart: unless-stopped
+    volumes:
+      - /opt/ipwatch-models:/app/models
+    ports:
+      - "127.0.0.1:8002:8002"
+    networks: [ipwatch-net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ipwatch
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - EMBED_SERVICE_URL=http://embed:8002
+    ports:
+      - "0.0.0.0:8001:8001"
+    depends_on:
+      pgbouncer:
+        condition: service_started
+      embed:
+        condition: service_healthy
+    networks: [ipwatch-net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s

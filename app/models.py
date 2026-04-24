@@ -149,6 +149,17 @@ class WatchlistAlert(Base):
     read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
 
+class WorkspaceScope(Base):
+    __tablename__ = "workspace_scope"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(PgUUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True)
+    search_strings: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    taxonomy_node_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    expanded_terms: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    include_all: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class InvestigationQueueItem(Base):
     __tablename__ = "investigation_queue"
 

@@ -87,7 +87,7 @@ async def _seed_default_users():
     from sqlalchemy import select
 
     seed_users = [
-        {"email": "admin@squarkip.com", "password": "admin", "full_name": "Admin", "role": "ADMIN"},
+        {"email": "admin@squarkip.com", "password": "Squire@1010", "full_name": "Admin", "role": "ADMIN"},
         {"email": "basant@squarkip.com", "password": "analystpassword", "full_name": "Basant Analyst", "role": "ANALYST"},
     ]
 

@@ -157,6 +157,8 @@ class WorkspaceScope(Base):
     taxonomy_node_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     expanded_terms: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     include_all: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    ignore_strings: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    ignore_taxonomy_node_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 

@@ -973,16 +973,32 @@ async def delete_taxonomy_node(
     current_user: dict = Depends(require_role(["ADMIN", "admin", "ANALYST", "analyst"])),
     db: AsyncSession = Depends(get_db),
 ):
-    # Delete children first
+    ws_uuid = _parse_ws_uuid(workspace_id) if workspace_id else None
+
+    # Collect the node + its direct children (2-level taxonomy). Their patent
+    # assignments must be cleared first — patent_taxonomy.taxonomy_node_id has a
+    # FK to taxonomy_nodes.node_id, so deleting a tagged node otherwise raises a
+    # ForeignKeyViolationError ("still referenced from table patent_taxonomy").
+    child_q = select(TaxonomyNode.node_id).where(TaxonomyNode.parent_id == node_id)
+    if ws_uuid:
+        child_q = child_q.where(TaxonomyNode.workspace_id == ws_uuid)
+    child_ids = list((await db.scalars(child_q)).all())
+    all_ids = [node_id, *child_ids]
+
+    # 1. Remove patent tag assignments referencing any of these nodes
+    await db.execute(
+        delete(PatentTaxonomy).where(PatentTaxonomy.taxonomy_node_id.in_(all_ids))
+    )
+
+    # 2. Delete child nodes
     child_stmt = delete(TaxonomyNode).where(TaxonomyNode.parent_id == node_id)
-    if workspace_id:
-        ws_uuid = _parse_ws_uuid(workspace_id)
+    if ws_uuid:
         child_stmt = child_stmt.where(TaxonomyNode.workspace_id == ws_uuid)
     await db.execute(child_stmt)
 
+    # 3. Delete the node itself
     del_stmt = delete(TaxonomyNode).where(TaxonomyNode.node_id == node_id)
-    if workspace_id:
-        ws_uuid = _parse_ws_uuid(workspace_id)
+    if ws_uuid:
         del_stmt = del_stmt.where(TaxonomyNode.workspace_id == ws_uuid)
     result = await db.execute(del_stmt)
     await db.commit()

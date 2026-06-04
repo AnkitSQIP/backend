@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, update, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 
 from app.models import TaxonomyNode, PatentTaxonomy, Patent
 from app.deps import get_db, get_current_user, require_role
@@ -1420,43 +1421,67 @@ async def generate_taxonomy_from_patents(
         logger.error(f"Taxonomy generation JSON parse failed ({exc}): {content[:200]!r}")
         raise HTTPException(status_code=503, detail="AI returned malformed output. Please try again.")
 
+    # Namespace generated IDs per-workspace. taxonomy_nodes.node_id carries a
+    # GLOBAL unique constraint, but the AI always emits generic ids (c1, c1a…)
+    # that repeat across workspaces — bare ids collide and crash the commit with
+    # a UniqueViolationError (surfaced to the browser as "Failed to fetch" because
+    # the unhandled 500 escapes CORSMiddleware). Prefix is deterministic from the
+    # workspace UUID so regeneration updates the same rows in place.
+    ws_prefix = ws_uuid.hex[:8]
+    def _ns(raw_id: str) -> str:
+        return f"{ws_prefix}_{raw_id}"
+
     created = 0
     skipped = 0
-    for node in nodes_data:
-        # Strict validation — drop any node that isn't a clean {id, label} dict
-        if not isinstance(node, dict):
-            skipped += 1
-            continue
-        node_id = str(node.get("id", "")).strip()
-        label = str(node.get("label", "")).strip()
-        parent_id = node.get("parent_id") or None
+    try:
+        for node in nodes_data:
+            # Strict validation — drop any node that isn't a clean {id, label} dict
+            if not isinstance(node, dict):
+                skipped += 1
+                continue
+            raw_id = str(node.get("id", "")).strip()
+            label = str(node.get("label", "")).strip()
+            raw_parent = node.get("parent_id") or None
 
-        if not node_id or not label:
-            skipped += 1
-            continue
-        # parent_id must be a string or None — reject garbage types
-        if parent_id is not None and not isinstance(parent_id, str):
-            parent_id = None
+            if not raw_id or not label:
+                skipped += 1
+                continue
+            # parent_id must be a string or None — reject garbage types
+            if raw_parent is not None and not isinstance(raw_parent, str):
+                raw_parent = None
 
-        existing = await db.scalar(
-            select(TaxonomyNode).where(
-                TaxonomyNode.node_id == node_id,
-                TaxonomyNode.workspace_id == ws_uuid,
+            node_id = _ns(raw_id)
+            parent_id = _ns(raw_parent.strip()) if raw_parent else None
+
+            existing = await db.scalar(
+                select(TaxonomyNode).where(
+                    TaxonomyNode.node_id == node_id,
+                    TaxonomyNode.workspace_id == ws_uuid,
+                )
             )
-        )
-        if existing:
-            existing.label = label
-        else:
-            db.add(TaxonomyNode(
-                node_id=node_id,
-                label=label,
-                workspace_id=ws_uuid,
-                parent_id=parent_id,
-                level=0 if parent_id is None else 1,
-            ))
-            created += 1
+            if existing:
+                existing.label = label
+            else:
+                db.add(TaxonomyNode(
+                    node_id=node_id,
+                    label=label,
+                    workspace_id=ws_uuid,
+                    parent_id=parent_id,
+                    level=0 if parent_id is None else 1,
+                ))
+                created += 1
 
-    await db.commit()
+        await db.commit()
+    except IntegrityError as exc:
+        # Any residual node_id collision — fail cleanly so the error surfaces
+        # through CORSMiddleware instead of as a raw "Failed to fetch".
+        await db.rollback()
+        logger.error(f"Taxonomy generation insert conflict: {exc}")
+        raise HTTPException(
+            status_code=409,
+            detail="Taxonomy node ID conflict while generating. Please retry.",
+        )
+
     if skipped:
         logger.warning(f"Taxonomy generation: skipped {skipped} malformed nodes from LLM output")
     return {"message": f"Generated {created} taxonomy nodes", "created": created, "total": len(nodes_data)}

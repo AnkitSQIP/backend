@@ -1,12 +1,13 @@
 import uuid
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Form
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_, case
+from sqlalchemy import select, func, and_, or_, case, delete
 
-from app.models import Patent, PatentTaxonomy, TaxonomyNode
+from app.models import Patent, PatentTaxonomy, TaxonomyNode, DashboardView
 from app.deps import get_db, get_current_user
 
 logger = logging.getLogger(__name__)
@@ -108,12 +109,58 @@ def _patent_to_full_dict(p: Patent) -> dict:
 
 # ── OVERVIEW ─────────────────────────────────────────────────────────────────
 
+async def _monthly_trend(
+    db: AsyncSession,
+    ws_uuid: Optional[uuid.UUID],
+    date_field,
+    window_start: Optional[datetime],
+) -> dict:
+    """Single GROUP BY date_trunc('month') query. Returns {"YYYY-MM": count}.
+
+    Replaces the old 12-iteration scalar loop — one round trip regardless of
+    window size, which keeps the overview fast at 60k+ patents."""
+    month_col = func.to_char(func.date_trunc("month", date_field), "YYYY-MM")
+    stmt = (
+        select(month_col.label("m"), func.count().label("c"))
+        .where(date_field.isnot(None))
+        .group_by(month_col)
+    )
+    if ws_uuid:
+        stmt = stmt.where(Patent.workspace_id == ws_uuid)
+    if window_start is not None:
+        stmt = stmt.where(date_field >= window_start)
+    result = await db.execute(stmt)
+    return {r.m: r.c for r in result}
+
+
+def _fill_month_buckets(counts: dict, months: int) -> list:
+    """Build a continuous list of {month, count} for the last `months` months
+    (gaps filled with 0). When months <= 0, return every present month sorted."""
+    if months <= 0:
+        return [{"month": k, "count": counts[k]} for k in sorted(counts)]
+    now = datetime.now(timezone.utc)
+    out = []
+    for i in range(months - 1, -1, -1):
+        target_month = now.month - i
+        target_year = now.year
+        while target_month <= 0:
+            target_month += 12
+            target_year -= 1
+        label = f"{target_year:04d}-{target_month:02d}"
+        out.append({"month": label, "count": counts.get(label, 0)})
+    return out
+
+
 @router.get("/analytics/overview")
 async def get_analytics_overview(
     workspace_id: Optional[str] = None,
+    months: int = 12,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Workspace overview KPIs + publication/filing trends.
+
+    `months` controls the trend window (12/24/36). Pass 0 for the full history."""
     ws_uuid = _ws_uuid(workspace_id)
 
     def _base(stmt):
@@ -146,36 +193,21 @@ async def get_analytics_overview(
     top_result = await db.execute(stmt)
     top_assignees = [{"assignee": r.assignee, "count": r.cnt} for r in top_result]
 
-    now = datetime.now(timezone.utc)
-    publication_trends = []
-    filing_trends = []
-    for i in range(12):
-        target_month = now.month - i
-        target_year = now.year
-        while target_month <= 0:
-            target_month += 12
-            target_year -= 1
-        month_start = datetime(target_year, target_month, 1, tzinfo=timezone.utc)
-        if target_month == 12:
-            month_end = datetime(target_year + 1, 1, 1, tzinfo=timezone.utc)
-        else:
-            month_end = datetime(target_year, target_month + 1, 1, tzinfo=timezone.utc)
-        label = month_start.strftime("%Y-%m")
+    # Trend window start (None = full history for months <= 0)
+    window_start = None
+    if months and months > 0:
+        now = datetime.now(timezone.utc)
+        start_month = now.month - (months - 1)
+        start_year = now.year
+        while start_month <= 0:
+            start_month += 12
+            start_year -= 1
+        window_start = datetime(start_year, start_month, 1, tzinfo=timezone.utc)
 
-        pub_stmt = select(func.count()).select_from(Patent).where(
-            Patent.publication_date >= month_start, Patent.publication_date < month_end
-        )
-        fil_stmt = select(func.count()).select_from(Patent).where(
-            Patent.filing_date >= month_start, Patent.filing_date < month_end
-        )
-        if ws_uuid:
-            pub_stmt = pub_stmt.where(Patent.workspace_id == ws_uuid)
-            fil_stmt = fil_stmt.where(Patent.workspace_id == ws_uuid)
-        publication_trends.append({"month": label, "count": await db.scalar(pub_stmt) or 0})
-        filing_trends.append({"month": label, "count": await db.scalar(fil_stmt) or 0})
-
-    publication_trends.reverse()
-    filing_trends.reverse()
+    pub_counts = await _monthly_trend(db, ws_uuid, Patent.publication_date, window_start)
+    fil_counts = await _monthly_trend(db, ws_uuid, Patent.filing_date, window_start)
+    publication_trends = _fill_month_buckets(pub_counts, months)
+    filing_trends = _fill_month_buckets(fil_counts, months)
 
     return {
         "total_patents": total_patents,
@@ -1211,3 +1243,299 @@ async def export_filtered_data(
         "all_patent_fields": all_fields,
         "total": len(patents),
     }
+
+
+# ── GENERIC AGGREGATION (powers the custom chart builder + new dashboards) ─────
+# All aggregation runs in Postgres and returns at most a few hundred grouped
+# rows — raw patents (5..60k) never reach the browser.
+
+# Dimensions that map directly to a Patent column.
+_DIM_COLUMNS = {
+    "assignee": Patent.assignee,
+    "legal_status": Patent.legal_status,
+    "jurisdiction": Patent.jurisdiction,
+    "publication_country": Patent.publication_country,
+    "cpc_class": Patent.cpc_class,
+    "ipc_class": Patent.ipc_class,
+    "review_status": Patent.review_status,
+}
+
+# Date dimensions -> (column, to_char format, date_trunc unit).
+_DATE_DIMS = {
+    "filing_year": (Patent.filing_date, "YYYY", "year"),
+    "publication_year": (Patent.publication_date, "YYYY", "year"),
+    "grant_year": (Patent.grant_date, "YYYY", "year"),
+    "filing_month": (Patent.filing_date, "YYYY-MM", "month"),
+    "publication_month": (Patent.publication_date, "YYYY-MM", "month"),
+}
+
+
+def _bucket_case(column, edges, labels):
+    """Build a CASE expression bucketing a numeric column. `edges` are upper
+    bounds (inclusive); `labels` has one more entry than `edges` for the
+    overflow bucket. NULLs fall through to 'Unknown'."""
+    whens = []
+    prev = None
+    for edge, label in zip(edges, labels):
+        if prev is None:
+            whens.append((column <= edge, label))
+        else:
+            whens.append((and_(column > prev, column <= edge), label))
+        prev = edge
+    expr = case(*whens, else_=labels[-1])
+    return case((column.is_(None), "Unknown"), else_=expr)
+
+
+_BUCKET_DIMS = {
+    "family_size_bucket": lambda: _bucket_case(
+        Patent.family_members_count, [1, 5, 10, 20], ["1", "2-5", "6-10", "11-20", "21+"]),
+    "claims_bucket": lambda: _bucket_case(
+        Patent.claims_count, [5, 10, 20, 40], ["1-5", "6-10", "11-20", "21-40", "41+"]),
+    "forward_citation_bucket": lambda: _bucket_case(
+        Patent.forward_citation_count, [0, 5, 20, 50], ["0", "1-5", "6-20", "21-50", "51+"]),
+    "backward_citation_bucket": lambda: _bucket_case(
+        Patent.backward_citation_count, [0, 5, 20, 50], ["0", "1-5", "6-20", "21-50", "51+"]),
+}
+
+
+async def _aggregate_conditions(db, ws_uuid, assignees, legal_statuses, taxonomy, date_type, date_from, date_to):
+    conds = []
+    if ws_uuid:
+        conds.append(Patent.workspace_id == ws_uuid)
+    conds += _assignee_conditions(assignees)
+    if legal_statuses:
+        statuses = [s.strip() for s in legal_statuses.split(",") if s.strip()]
+        if statuses:
+            conds.append(Patent.legal_status.in_(statuses))
+    if date_type and (date_from or date_to):
+        conds += _date_conditions(date_type, date_from, date_to)
+    if taxonomy:
+        labels = [t.strip() for t in taxonomy.split(",") if t.strip()]
+        node_ids = await _get_ws_node_ids(db, ws_uuid)
+        pns = await _get_pns_by_taxonomy_labels(db, labels, node_ids)
+        if pns is not None:
+            conds.append(Patent.patent_number.in_(pns if pns else ["__none__"]))
+    return conds
+
+
+@router.post("/analytics/aggregate")
+async def aggregate(
+    workspace_id: Optional[str] = Form(None),
+    dimension: str = Form(...),
+    measure: str = Form("count"),
+    top_n: int = Form(20),
+    assignees: Optional[str] = Form(None),
+    legal_statuses: Optional[str] = Form(None),
+    taxonomy: Optional[str] = Form(None),
+    date_type: Optional[str] = Form(None),
+    date_from: Optional[str] = Form(None),
+    date_to: Optional[str] = Form(None),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Group patents by `dimension`, aggregate by `measure`. Returns
+    [{label, value}] plus a total. Categorical dims are reduced to top_n with
+    an 'Other' bucket; date dims return chronologically; bucket dims keep their
+    natural bucket order."""
+    ws_uuid = _ws_uuid(workspace_id)
+    conds = await _aggregate_conditions(
+        db, ws_uuid, assignees, legal_statuses, taxonomy, date_type, date_from, date_to)
+
+    # Measure expression
+    if measure == "avg_forward_citations":
+        measure_expr = func.round(func.avg(Patent.forward_citation_count), 1)
+    elif measure == "avg_backward_citations":
+        measure_expr = func.round(func.avg(Patent.backward_citation_count), 1)
+    elif measure == "sum_family_size":
+        measure_expr = func.sum(Patent.family_members_count)
+    else:
+        measure_expr = func.count()
+
+    is_temporal = dimension in _DATE_DIMS
+    is_bucket = dimension in _BUCKET_DIMS
+
+    if dimension == "taxonomy_label":
+        node_ids = await _get_ws_node_ids(db, ws_uuid)
+        stmt = (
+            select(PatentTaxonomy.taxonomy_label.label("k"), func.count().label("v"))
+            .join(Patent, Patent.patent_number == PatentTaxonomy.patent_number)
+            .where(and_(*conds))
+            .group_by(PatentTaxonomy.taxonomy_label)
+        )
+        if node_ids:
+            stmt = stmt.where(PatentTaxonomy.taxonomy_node_id.in_(list(node_ids)))
+    elif is_temporal:
+        col, fmt, unit = _DATE_DIMS[dimension]
+        key = func.to_char(func.date_trunc(unit, col), fmt)
+        stmt = (
+            select(key.label("k"), measure_expr.label("v"))
+            .where(and_(col.isnot(None), *conds))
+            .group_by(key)
+        )
+    elif is_bucket:
+        key = _BUCKET_DIMS[dimension]()
+        stmt = (
+            select(key.label("k"), measure_expr.label("v"))
+            .where(and_(*conds))
+            .group_by(key)
+        )
+    elif dimension in _DIM_COLUMNS:
+        col = _DIM_COLUMNS[dimension]
+        stmt = (
+            select(col.label("k"), measure_expr.label("v"))
+            .where(and_(col.isnot(None), *conds))
+            .group_by(col)
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown dimension: {dimension}")
+
+    result = await db.execute(stmt)
+    rows = [
+        {"label": (r.k if r.k is not None else "—"), "value": float(r.v or 0)}
+        for r in result
+    ]
+
+    # Order + shape per dimension kind
+    if is_temporal:
+        rows.sort(key=lambda d: d["label"])
+    elif is_bucket:
+        order = {lab: i for i, lab in enumerate(
+            ["Unknown", "0", "1", "1-5", "2-5", "6-10", "6-20", "11-20", "21-40",
+             "21-50", "21+", "41+", "51+"])}
+        rows.sort(key=lambda d: order.get(d["label"], 999))
+    else:
+        rows.sort(key=lambda d: d["value"], reverse=True)
+        if top_n and len(rows) > top_n:
+            head = rows[:top_n]
+            tail = rows[top_n:]
+            other_val = sum(d["value"] for d in tail)
+            if other_val > 0:
+                head.append({"label": f"Other ({len(tail)})", "value": other_val})
+            rows = head
+
+    # Count measures should come back as ints
+    if measure == "count" or measure == "sum_family_size":
+        for r in rows:
+            r["value"] = int(r["value"])
+
+    return {
+        "dimension": dimension,
+        "measure": measure,
+        "data": rows,
+        "total": sum(r["value"] for r in rows),
+    }
+
+
+# ── SAVED DASHBOARD VIEWS (per user + workspace) ──────────────────────────────
+
+def _view_dict(v: DashboardView) -> dict:
+    return {
+        "id": str(v.id),
+        "name": v.name,
+        "config": v.config,
+        "sort_order": v.sort_order,
+        "created_at": v.created_at.isoformat() if v.created_at else None,
+        "updated_at": v.updated_at.isoformat() if v.updated_at else None,
+    }
+
+
+def _current_user_uuid(current_user: dict) -> uuid.UUID:
+    try:
+        return uuid.UUID(current_user["user_id"])
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid user token")
+
+
+@router.get("/analytics/views")
+async def list_dashboard_views(
+    workspace_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    ws_uuid = _ws_uuid(workspace_id)
+    uid = _current_user_uuid(current_user)
+    result = await db.scalars(
+        select(DashboardView)
+        .where(DashboardView.workspace_id == ws_uuid, DashboardView.user_id == uid)
+        .order_by(DashboardView.sort_order, DashboardView.created_at)
+    )
+    return {"views": [_view_dict(v) for v in result.all()]}
+
+
+@router.post("/analytics/views")
+async def create_dashboard_view(
+    workspace_id: str = Form(...),
+    name: str = Form(...),
+    config: str = Form(...),
+    sort_order: int = Form(0),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    ws_uuid = _ws_uuid(workspace_id)
+    uid = _current_user_uuid(current_user)
+    try:
+        config_obj = json.loads(config)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="config must be valid JSON")
+    view = DashboardView(
+        workspace_id=ws_uuid, user_id=uid,
+        name=name.strip() or "Untitled chart",
+        config=config_obj, sort_order=sort_order,
+    )
+    db.add(view)
+    await db.commit()
+    await db.refresh(view)
+    return _view_dict(view)
+
+
+@router.put("/analytics/views/{view_id}")
+async def update_dashboard_view(
+    view_id: str,
+    name: Optional[str] = Form(None),
+    config: Optional[str] = Form(None),
+    sort_order: Optional[int] = Form(None),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    uid = _current_user_uuid(current_user)
+    try:
+        vid = uuid.UUID(view_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid view id")
+    view = await db.scalar(
+        select(DashboardView).where(DashboardView.id == vid, DashboardView.user_id == uid)
+    )
+    if not view:
+        raise HTTPException(status_code=404, detail="View not found")
+    if name is not None:
+        view.name = name.strip() or view.name
+    if config is not None:
+        try:
+            view.config = json.loads(config)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="config must be valid JSON")
+    if sort_order is not None:
+        view.sort_order = sort_order
+    await db.commit()
+    await db.refresh(view)
+    return _view_dict(view)
+
+
+@router.delete("/analytics/views/{view_id}")
+async def delete_dashboard_view(
+    view_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    uid = _current_user_uuid(current_user)
+    try:
+        vid = uuid.UUID(view_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid view id")
+    result = await db.execute(
+        delete(DashboardView).where(DashboardView.id == vid, DashboardView.user_id == uid)
+    )
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="View not found")
+    return {"message": "View deleted", "id": view_id}
